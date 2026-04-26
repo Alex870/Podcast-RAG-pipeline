@@ -1,5 +1,6 @@
 param(
     [string]$Config,
+    [string]$CondaEnvName = "podcast-rag-pipeline",
     [string]$InputDir,
     [string]$FileGlob,
     [string]$Model,
@@ -7,15 +8,55 @@ param(
     [switch]$OneFile,
     [switch]$CreateStopFile,
     [switch]$ClearStopFile,
+    [switch]$CreateCondaEnv,
     [switch]$SkipDependencyCheck
 )
 
 $PythonScript = Join-Path $PSScriptRoot "podcast_rag_pipeline.py"
 $ConfigPath = Join-Path $PSScriptRoot "podcast_rag_config.json"
 $ConfigExamplePath = Join-Path $PSScriptRoot "podcast_rag_config.example.json"
+$RequirementsPath = Join-Path $PSScriptRoot "podcast_rag_requirements.txt"
 
 if (-not $Config) {
     $Config = $ConfigPath
+}
+
+function Invoke-ProjectPython {
+    param(
+        [string[]]$Arguments
+    )
+
+    & conda run --no-capture-output -n $CondaEnvName python @Arguments
+    return $LASTEXITCODE
+}
+
+function Test-CondaEnv {
+    $envListJson = & conda env list --json | ConvertFrom-Json
+    foreach ($envPath in $envListJson.envs) {
+        if ((Split-Path -Leaf $envPath) -eq $CondaEnvName) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function New-ProjectCondaEnv {
+    if (Test-CondaEnv) {
+        Write-Host "Conda environment already exists: $CondaEnvName"
+        return
+    }
+
+    & conda create -y -n $CondaEnvName python=3.11 pip
+    if ($LASTEXITCODE -eq 0) {
+        & conda run --no-capture-output -n $CondaEnvName python -m pip install --upgrade pip
+    }
+    if ($LASTEXITCODE -eq 0) {
+        & conda run --no-capture-output -n $CondaEnvName python -m pip install -r $RequirementsPath
+    }
+
+    if ($LASTEXITCODE -ne 0) {
+        exit $LASTEXITCODE
+    }
 }
 
 function Test-PythonDependencies {
@@ -33,7 +74,6 @@ required = [
     'numpy',
     'openai',
     'sklearn',
-    'umap',
 ]
 missing = []
 for name in required:
@@ -47,8 +87,12 @@ if missing:
     sys.exit(1)
 "@
 
-    & python -c $dependencyCheck
+    Invoke-ProjectPython -Arguments @("-c", $dependencyCheck)
     return $LASTEXITCODE
+}
+
+if (-not (Get-Command conda -ErrorAction SilentlyContinue)) {
+    throw "Conda was not found on PATH. Open a Miniconda/Anaconda PowerShell prompt, or add Conda to PATH."
 }
 
 if (-not (Test-Path -LiteralPath $Config)) {
@@ -61,8 +105,18 @@ if (-not (Test-Path -LiteralPath $Config)) {
 }
 
 if ($CreateStopFile) {
-    & python $PythonScript --config $Config --create-stop-file
-    exit $LASTEXITCODE
+    $configObject = Get-Content -LiteralPath $Config -Raw | ConvertFrom-Json
+    $stopPath = if ($configObject.stop_file) { [string]$configObject.stop_file } else { "state/stop_after_current.txt" }
+    if (-not [System.IO.Path]::IsPathRooted($stopPath)) {
+        $stopPath = Join-Path $PSScriptRoot $stopPath
+    }
+    $stopDir = Split-Path -Parent $stopPath
+    if ($stopDir -and -not (Test-Path -LiteralPath $stopDir)) {
+        New-Item -ItemType Directory -Path $stopDir | Out-Null
+    }
+    "Stop requested at $(Get-Date -Format o)" | Set-Content -LiteralPath $stopPath -Encoding UTF8
+    Write-Host "Created stop file: $stopPath"
+    exit 0
 }
 
 if ($ClearStopFile) {
@@ -77,12 +131,24 @@ if ($ClearStopFile) {
     }
 }
 
+if ($CreateCondaEnv) {
+    New-ProjectCondaEnv
+    exit 0
+}
+
+if (-not (Test-CondaEnv)) {
+    Write-Host "Conda environment '$CondaEnvName' was not found."
+    Write-Host "Create it with:"
+    Write-Host "  .\Run Podcast RAG Pipeline.ps1 -CreateCondaEnv"
+    exit 1
+}
+
 if (-not $SkipDependencyCheck) {
     $dependencyExitCode = Test-PythonDependencies
     if ($dependencyExitCode -ne 0) {
         Write-Host ""
         Write-Host "Python dependencies are missing. Install them with:"
-        Write-Host "  python -m pip install -r `"$PSScriptRoot\podcast_rag_requirements.txt`""
+        Write-Host "  conda run -n $CondaEnvName python -m pip install -r `"$RequirementsPath`""
         exit $dependencyExitCode
     }
 }
@@ -109,5 +175,6 @@ if ($OneFile) {
     $argsList += "--one-file"
 }
 
-& python $PythonScript @argsList
+$pythonArgs = @($PythonScript) + $argsList
+Invoke-ProjectPython -Arguments $pythonArgs
 exit $LASTEXITCODE

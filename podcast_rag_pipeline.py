@@ -23,7 +23,7 @@ RUNTIME_DEPS_LOADED = False
 
 def load_runtime_deps() -> None:
     global RUNTIME_DEPS_LOADED
-    global hdbscan, np, umap, Chroma, Document, StrOutputParser, ChatPromptTemplate
+    global hdbscan, np, PCA, Chroma, Document, StrOutputParser, ChatPromptTemplate
     global HuggingFaceEmbeddings, ChatOpenAI, RecursiveCharacterTextSplitter, OpenAI, normalize
 
     if RUNTIME_DEPS_LOADED:
@@ -31,7 +31,6 @@ def load_runtime_deps() -> None:
 
     import hdbscan
     import numpy as np
-    import umap
     from langchain_chroma import Chroma
     from langchain_core.documents import Document
     from langchain_core.output_parsers import StrOutputParser
@@ -40,6 +39,7 @@ def load_runtime_deps() -> None:
     from langchain_openai import ChatOpenAI
     from langchain_text_splitters import RecursiveCharacterTextSplitter
     from openai import OpenAI
+    from sklearn.decomposition import PCA
     from sklearn.preprocessing import normalize
 
     RUNTIME_DEPS_LOADED = True
@@ -510,15 +510,11 @@ class PodcastRagPipeline:
         batch_size = min(self.config.embedding_batch_size, max(8, len(texts)))
         embeds = normalize(np.array(self.embed_in_batches(texts[:]), dtype=float))
 
-        reducer = umap.UMAP(
-            n_neighbors=min(20, len(documents) - 1),
-            n_components=5,
-            metric="cosine",
-            min_dist=0.01,
-            spread=1.0,
-            random_state=42,
-        )
-        reduced = reducer.fit_transform(embeds)
+        n_components = min(5, len(documents) - 1, embeds.shape[1])
+        if n_components >= 2:
+            reduced = PCA(n_components=n_components, random_state=42).fit_transform(embeds)
+        else:
+            reduced = embeds
 
         min_cluster_size = max(3, min(8, len(documents) // 8))
         labels = hdbscan.HDBSCAN(min_cluster_size=min_cluster_size).fit_predict(reduced)

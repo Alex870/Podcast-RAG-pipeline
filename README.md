@@ -13,6 +13,7 @@ For overnight batch processing, local LM Studio processing is the sensible defau
 - `podcast_rag_pipeline.py`: main restartable Python pipeline
 - `Run Podcast RAG Pipeline.ps1`: Windows PowerShell launcher
 - `podcast_rag_config.example.json`: editable runtime configuration template
+- `environment.yml`: Miniconda/Conda environment definition
 - `podcast_rag_requirements.txt`: Python dependency list
 - `LICENSE`: GPL-3.0 license
 
@@ -20,14 +21,13 @@ For overnight batch processing, local LM Studio processing is the sensible defau
 
 1. Start LM Studio and load your model.
 2. Enable the local OpenAI-compatible server in LM Studio.
-3. Install Python dependencies:
+3. Create the Conda environment:
 
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -r .\podcast_rag_requirements.txt
+.\Run Podcast RAG Pipeline.ps1 -CreateCondaEnv
 ```
+
+The launcher uses the `podcast-rag-pipeline` Conda environment by default. Override it with `-CondaEnvName` if you want a different name.
 
 4. Copy the example config:
 
@@ -54,6 +54,7 @@ Useful launcher parameters:
 .\Run Podcast RAG Pipeline.ps1 -OneFile
 .\Run Podcast RAG Pipeline.ps1 -CreateStopFile
 .\Run Podcast RAG Pipeline.ps1 -ClearStopFile
+.\Run Podcast RAG Pipeline.ps1 -CondaEnvName "podcast-rag-pipeline"
 ```
 
 ## Stopping After The Current File
