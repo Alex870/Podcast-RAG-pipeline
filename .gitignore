@@ -1,0 +1,12 @@
+.env
+podcast_rag_config.json
+data/
+processed/
+chroma_db*/
+state/
+logs/
+*.pyc
+__pycache__/
+.venv/
+.pytest_cache/
+

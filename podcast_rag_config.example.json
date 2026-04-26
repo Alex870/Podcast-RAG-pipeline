@@ -1,0 +1,28 @@
+{
+  "input_dir": "data",
+  "file_glob": "**/*_speaker_transcript.json",
+  "processed_dir": "processed",
+  "state_path": "state/podcast_rag_state.json",
+  "stop_file": "state/stop_after_current.txt",
+  "move_processed_files": false,
+  "persist_dir": "chroma_db_raptor_v2",
+  "collection_name": "whisper_rag_v2",
+  "embedding_model": "BAAI/bge-large-en-v1.5",
+  "lm_studio_base_url": "http://127.0.0.1:1234/v1",
+  "lm_studio_api_key": "lm-studio",
+  "lm_studio_model": "qwen3.6-35b-a3b",
+  "verify_model": true,
+  "test_inference": true,
+  "max_threads": 2,
+  "max_levels": 4,
+  "max_clusters": 300,
+  "min_docs_to_cluster": 12,
+  "group_fallback_size": 6,
+  "rollup_char_budget": 12000,
+  "leaf_chunk_size": 1800,
+  "leaf_chunk_overlap": 250,
+  "max_position_source_docs": 40,
+  "embedding_batch_size": 64,
+  "llm_max_tokens": 1024
+}
+

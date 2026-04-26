@@ -1,0 +1,15 @@
+chromadb
+hdbscan
+langchain
+langchain-chroma
+langchain-community
+langchain-core
+langchain-huggingface
+langchain-openai
+langchain-text-splitters
+numpy
+openai
+scikit-learn
+sentence-transformers
+umap-learn
+
