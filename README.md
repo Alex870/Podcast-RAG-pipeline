@@ -12,6 +12,7 @@ For overnight batch processing, local LM Studio processing is the sensible defau
 
 - `podcast_rag_pipeline.py`: main restartable Python pipeline
 - `Run Podcast RAG Pipeline.ps1`: Windows PowerShell launcher
+- `Test Podcast RAG Environment.ps1`: dependency and runtime diagnostic script
 - `podcast_rag_config.example.json`: editable runtime configuration template
 - `environment.yml`: Miniconda/Conda environment definition
 - `podcast_rag_requirements.txt`: Python dependency list
@@ -38,6 +39,12 @@ Copy-Item .\podcast_rag_config.example.json .\podcast_rag_config.json
 5. Put transcript JSON files under `data`, or point `input_dir` at the output directory from your transcription project.
 
 ## Running
+
+Before a batch run, verify the local environment:
+
+```powershell
+.\Test Podcast RAG Environment.ps1
+```
 
 ```powershell
 .\Run Podcast RAG Pipeline.ps1
