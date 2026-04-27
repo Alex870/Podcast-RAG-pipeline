@@ -59,7 +59,7 @@ class PipelineConfig:
     embedding_model: str = "BAAI/bge-large-en-v1.5"
     lm_studio_base_url: str = "http://127.0.0.1:1234/v1"
     lm_studio_api_key: str = "lm-studio"
-    lm_studio_model: str = "qwen3.6-35b-a3b"
+    lm_studio_model: str = "unsloth/qwen3.6-35b-a3b"
     verify_model: bool = True
     test_inference: bool = True
     max_threads: int = 2

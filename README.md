@@ -2,7 +2,7 @@
 
 This project builds a retrieval-oriented podcast knowledge base from JSON transcript files produced by `podcast_transcribe_host.py`. It creates leaf chunks, RAPTOR-style rollup summaries, episode thesis summaries, and durable position cards, then stores them in a persistent Chroma collection.
 
-The default workflow targets a local LM Studio server on Windows 11 using LM Studio's OpenAI-compatible API. The included example config defaults to `http://127.0.0.1:1234/v1` with `qwen3.6-35b-a3b`, but both values are configurable.
+The default workflow targets a local LM Studio server on Windows 11 using LM Studio's OpenAI-compatible API. The included example config defaults to `http://127.0.0.1:1234/v1` with `unsloth/qwen3.6-35b-a3b`, but both values are configurable.
 
 ## Local Versus Cloud
 
@@ -57,7 +57,7 @@ Useful launcher parameters:
 
 ```powershell
 .\Run Podcast RAG Pipeline.ps1 -InputDir "C:\path\to\transcripts"
-.\Run Podcast RAG Pipeline.ps1 -Model "qwen3.6-35b-a3b"
+.\Run Podcast RAG Pipeline.ps1 -Model "unsloth/qwen3.6-35b-a3b"
 .\Run Podcast RAG Pipeline.ps1 -BaseUrl "http://127.0.0.1:1234/v1"
 .\Run Podcast RAG Pipeline.ps1 -OneFile
 .\Run Podcast RAG Pipeline.ps1 -MaxParallelModelRequests 2
