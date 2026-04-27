@@ -595,16 +595,21 @@ class PodcastRagPipeline:
                 error="All retries returned missing-context responses.",
             )
             print(f"  debug saved: {debug_path}")
-        except Exception:
+        except Exception as exc:
             self.performance.record_failure()
+            error_text = f"{type(exc).__name__}: {exc}"
             debug_path = self.write_llm_debug_event(
                 label=label,
                 event="llm_exception",
                 prompt_text=text,
-                error="LLM request failed before a valid response was accepted.",
+                error=error_text,
             )
             print(f"  debug saved: {debug_path}")
-            raise
+            if "position extraction" in label:
+                print(f"  {label} failed after retries; using empty position list. error={error_text}")
+                return '{"positions": []}'
+            print(f"  {label} failed after retries; using fallback extractive summary. error={error_text}")
+            result = fallback_summary_from_text(text, label)
 
         self.performance.record_llm_result(label, time.time() - start, result)
         return result
