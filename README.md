@@ -15,6 +15,7 @@ For overnight batch processing, local LM Studio processing is the sensible defau
 - `podcast_rag_pipeline.py`: main restartable Python pipeline
 - `Run Podcast RAG Pipeline.ps1`: Windows PowerShell launcher
 - `Test Podcast RAG Environment.ps1`: dependency and runtime diagnostic script
+- `Test Processed Data Cache.ps1`: scans cached processed documents for invalid missing-context LLM responses
 - `Set Podcast RAG Control.ps1`: live control helper for active batch runs
 - `podcast_rag_config.example.json`: editable runtime configuration template
 - `environment.yml`: Miniconda/Conda environment definition
@@ -100,6 +101,12 @@ The stop file is intentionally left in place so the request is visible. Remove i
 Progress is tracked in `state/podcast_rag_state.json`. Completed files are skipped on later runs using a stable fingerprint derived from file path, size, and modification time. If a file changes, it is treated as new work.
 
 Processed document caches are stored in `processed_data` using the same file fingerprint. When a matching cache exists, the pipeline skips LLM processing for that transcript and inserts the cached documents into Chroma instead. If every pending file has a cache, LM Studio model verification is skipped because no model generation is needed.
+
+To scan existing caches for missing-context LLM responses:
+
+```powershell
+.\Test Processed Data Cache.ps1
+```
 
 By default, input JSON files are not moved after processing. Set `move_processed_files` to `true` if you prefer the older workflow where processed files are moved to `processed`.
 

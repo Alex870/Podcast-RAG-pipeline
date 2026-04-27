@@ -300,6 +300,27 @@ def merge_speaker_values(values) -> list[str]:
     return [value for value in dict.fromkeys(v for v in values if v)]
 
 
+def has_substantive_text(text: str, min_chars: int = 40) -> bool:
+    compact = re.sub(r"\s+", " ", text or "").strip()
+    return len(compact) >= min_chars
+
+
+def is_missing_context_response(text: str) -> bool:
+    compact = re.sub(r"\s+", " ", text or "").strip().lower()
+    if not compact:
+        return True
+    patterns = [
+        "please provide the podcast transcript",
+        "please provide the transcript",
+        "please provide the source text",
+        "once shared",
+        "once you share",
+        "i'll generate",
+        "i can summarize",
+    ]
+    return any(pattern in compact for pattern in patterns)
+
+
 def verify_model_available(config: PipelineConfig) -> None:
     client = OpenAI(base_url=config.lm_studio_base_url, api_key=config.lm_studio_api_key)
     models = [model.id for model in client.models.list().data]
@@ -466,10 +487,18 @@ class PodcastRagPipeline:
     def invoke_llm(self, chain, text: str, label: str) -> str:
         if STOP_REQUESTED:
             raise PipelineInterrupted("Stop requested before starting another model request.")
+        if not has_substantive_text(text):
+            raise ValueError(f"{label} received empty or too-short source text.")
 
         start = time.time()
         try:
-            result = with_retry(lambda: chain.invoke({"text": text}), label)
+            def run_and_validate():
+                candidate = chain.invoke({"text": text})
+                if is_missing_context_response(candidate):
+                    raise ValueError(f"{label} returned a missing-context response instead of a summary.")
+                return candidate
+
+            result = with_retry(run_and_validate, label)
         except Exception:
             self.performance.record_failure()
             raise
@@ -562,10 +591,15 @@ class PodcastRagPipeline:
     def reduce_text_blocks(self, blocks: list[str], chain, label: str) -> str:
         pending = []
         for block in blocks:
+            if not has_substantive_text(block):
+                continue
             if len(block) <= self.config.rollup_char_budget:
                 pending.append(block)
             else:
-                pending.extend(self.rollup_splitter.split_text(block))
+                pending.extend(part for part in self.rollup_splitter.split_text(block) if has_substantive_text(part))
+
+        if not pending:
+            raise ValueError(f"{label} had no substantive text blocks to summarize.")
 
         while True:
             joined = "\n\n".join(pending)
