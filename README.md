@@ -2,6 +2,8 @@
 
 This project builds a retrieval-oriented podcast knowledge base from JSON transcript files produced by `podcast_transcribe_host.py`. It creates leaf chunks, RAPTOR-style rollup summaries, episode thesis summaries, and durable position cards, then stores them in a persistent Chroma collection.
 
+Before documents are inserted into Chroma, the LLM-produced processed documents are saved under `processed_data`. If you wipe the Chroma database later, rerunning the pipeline can load those cached documents and reinsert them without repeating the expensive LLM summarization work.
+
 The default workflow targets a local LM Studio server on Windows 11 using LM Studio's OpenAI-compatible API. The included example config defaults to `http://127.0.0.1:1234/v1` with `unsloth/qwen3.6-35b-a3b`, but both values are configurable.
 
 ## Local Versus Cloud
@@ -96,6 +98,8 @@ The stop file is intentionally left in place so the request is visible. Remove i
 ## State And Resume
 
 Progress is tracked in `state/podcast_rag_state.json`. Completed files are skipped on later runs using a stable fingerprint derived from file path, size, and modification time. If a file changes, it is treated as new work.
+
+Processed document caches are stored in `processed_data` using the same file fingerprint. When a matching cache exists, the pipeline skips LLM processing for that transcript and inserts the cached documents into Chroma instead. If every pending file has a cache, LM Studio model verification is skipped because no model generation is needed.
 
 By default, input JSON files are not moved after processing. Set `move_processed_files` to `true` if you prefer the older workflow where processed files are moved to `processed`.
 

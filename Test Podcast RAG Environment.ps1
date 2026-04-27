@@ -233,6 +233,7 @@ if ($configObject) {
     $inputDir = Resolve-ProjectPath ([string]$configObject.input_dir)
     $fileGlob = if ($configObject.file_glob) { [string]$configObject.file_glob } else { "**/*_speaker_transcript.json" }
     $processedDir = Resolve-ProjectPath ([string]$configObject.processed_dir)
+    $processedDataDir = Resolve-ProjectPath ([string]$configObject.processed_data_dir)
     $statePath = Resolve-ProjectPath ([string]$configObject.state_path)
     $persistDir = Resolve-ProjectPath ([string]$configObject.persist_dir)
     $stopFile = Resolve-ProjectPath ([string]$configObject.stop_file)
@@ -255,6 +256,10 @@ if ($configObject) {
 
     if ($processedDir) {
         Test-WritableDirectory -Name "Processed directory" -Path $processedDir
+    }
+
+    if ($processedDataDir) {
+        Test-WritableDirectory -Name "Processed data cache directory" -Path $processedDataDir
     }
 
     if ($statePath) {

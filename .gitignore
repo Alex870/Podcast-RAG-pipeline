@@ -2,6 +2,7 @@
 podcast_rag_config.json
 data/
 processed/
+processed_data/
 chroma_db*/
 state/
 logs/
@@ -9,4 +10,3 @@ logs/
 __pycache__/
 .venv/
 .pytest_cache/
-

@@ -53,6 +53,7 @@ class PipelineConfig:
     state_path: str = "state/podcast_rag_state.json"
     stop_file: str = "state/stop_after_current.txt"
     control_file: str = "state/pipeline_control.json"
+    processed_data_dir: str = "processed_data"
     move_processed_files: bool = False
     persist_dir: str = "chroma_db_raptor_v2"
     collection_name: str = "whisper_rag_v2"
@@ -852,6 +853,58 @@ class PodcastRagPipeline:
     def sanitize_documents(self, docs: list[Document]) -> list[Document]:
         return [Document(page_content=doc.page_content, metadata=self.sanitize_metadata(doc.metadata)) for doc in docs]
 
+    def insert_documents(self, docs: list[Document]) -> None:
+        ids = [doc.metadata["node_id"] for doc in docs]
+        self.vectorstore.add_documents(self.sanitize_documents(docs), ids=ids)
+
+    def load_cached_documents(self, cache_path: Path) -> list[Document]:
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+        docs = []
+        for item in payload.get("documents", []):
+            if not isinstance(item, dict):
+                continue
+            docs.append(
+                Document(
+                    page_content=str(item.get("page_content", "")),
+                    metadata=dict(item.get("metadata") or {}),
+                )
+            )
+        return docs
+
+    def save_cached_documents(self, cache_path: Path, source_path: Path, fingerprint: str, docs: list[Document]) -> None:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "version": 1,
+            "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "source_path": str(source_path),
+            "source_fingerprint": fingerprint,
+            "document_count": len(docs),
+            "documents": [
+                {
+                    "page_content": doc.page_content,
+                    "metadata": doc.metadata,
+                }
+                for doc in docs
+            ],
+        }
+        temp_path = cache_path.with_suffix(".tmp")
+        temp_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
+        temp_path.replace(cache_path)
+
+    def insert_cached_file(self, path: Path, fingerprint: str, cache_path: Path) -> dict[str, Any]:
+        print(f"\nLoading cached processed data: {cache_path}")
+        docs = self.load_cached_documents(cache_path)
+        if not docs:
+            raise RuntimeError(f"Processed data cache was empty: {cache_path}")
+        self.insert_documents(docs)
+        print(f"  Inserted {len(docs)} cached documents into vector DB for {path}")
+        return {
+            "status": "completed",
+            "source": "processed_data_cache",
+            "nodes": len(docs),
+            "cache_path": str(cache_path),
+        }
+
     def process_file(self, path: Path) -> dict[str, Any]:
         source = str(path)
         print(f"\nProcessing: {source}")
@@ -874,15 +927,25 @@ class PodcastRagPipeline:
             f"{len(position_docs)} position cards in {elapsed}"
         )
 
-        ids = [doc.metadata["node_id"] for doc in all_nodes]
-        self.vectorstore.add_documents(self.sanitize_documents(all_nodes), ids=ids)
         self.performance.maybe_report("file complete", force=True)
-        return {"status": "completed", "nodes": len(all_nodes), "position_cards": len(position_docs), "elapsed_seconds": int(time.time() - start)}
+        return {
+            "status": "completed",
+            "source": "llm_processing",
+            "nodes": len(all_nodes),
+            "position_cards": len(position_docs),
+            "elapsed_seconds": int(time.time() - start),
+            "documents": all_nodes,
+        }
 
 
 def should_skip_file(state: dict[str, Any], fingerprint: str) -> bool:
     entry = state.get("files", {}).get(fingerprint)
     return bool(entry and entry.get("status") in {"completed", "skipped"})
+
+
+def processed_data_cache_path(processed_data_dir: Path, fingerprint: str, source_path: Path) -> Path:
+    safe_stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", source_path.stem).strip("._") or "transcript"
+    return processed_data_dir / f"{safe_stem}.{fingerprint}.processed_documents.json"
 
 
 def mark_state(state: dict[str, Any], fingerprint: str, path: Path, status: str, extra: dict[str, Any] | None = None) -> None:
@@ -908,31 +971,42 @@ def run_batch(config: PipelineConfig, project_dir: Path, one_file: bool) -> int:
 
     input_dir = resolve_path(project_dir, config.input_dir)
     processed_dir = resolve_path(project_dir, config.processed_dir)
+    processed_data_dir = resolve_path(project_dir, config.processed_data_dir)
     state_path = resolve_path(project_dir, config.state_path)
     stop_file = resolve_path(project_dir, config.stop_file)
 
     input_dir.mkdir(parents=True, exist_ok=True)
     processed_dir.mkdir(parents=True, exist_ok=True)
+    processed_data_dir.mkdir(parents=True, exist_ok=True)
     stop_file.parent.mkdir(parents=True, exist_ok=True)
     control = RuntimeControl(config, project_dir)
     control.initialize_file_for_run()
-
-    if config.verify_model:
-        verify_model_available(config)
-    if config.test_inference:
-        test_model_inference(config)
 
     state = load_state(state_path)
     files = iter_transcript_files(input_dir, config.file_glob)
     pending = []
     for path in files:
         fingerprint = file_fingerprint(path)
-        if not should_skip_file(state, fingerprint):
+        cache_path = processed_data_cache_path(processed_data_dir, fingerprint, path)
+        if cache_path.exists() or not should_skip_file(state, fingerprint):
             pending.append((path, fingerprint))
 
     print(f"Found {len(files)} matching files; {len(pending)} pending.")
     if not pending:
         return 0
+
+    cached_pending = [
+        processed_data_cache_path(processed_data_dir, fingerprint, path).exists()
+        for path, fingerprint in pending
+    ]
+    needs_llm_processing = not all(cached_pending)
+    if needs_llm_processing:
+        if config.verify_model:
+            verify_model_available(config)
+        if config.test_inference:
+            test_model_inference(config)
+    else:
+        print("All pending files have processed data caches; skipping LM Studio model verification.")
 
     pipeline = PodcastRagPipeline(config, project_dir, control)
 
@@ -941,12 +1015,26 @@ def run_batch(config: PipelineConfig, project_dir: Path, one_file: bool) -> int:
             print("Stop requested before starting next file.")
             break
 
+        cache_path = processed_data_cache_path(processed_data_dir, fingerprint, path)
         print(f"\nFile {idx}/{len(pending)}")
-        mark_state(state, fingerprint, path, "in_progress")
-        save_state(state_path, state)
 
         try:
-            result = pipeline.process_file(path)
+            if cache_path.exists():
+                result = pipeline.insert_cached_file(path, fingerprint, cache_path)
+            else:
+                mark_state(state, fingerprint, path, "in_progress")
+                save_state(state_path, state)
+                result = pipeline.process_file(path)
+                if result["status"] != "completed":
+                    mark_state(state, fingerprint, path, result["status"], result)
+                    save_state(state_path, state)
+                    continue
+                docs = result.pop("documents", [])
+                pipeline.save_cached_documents(cache_path, path, fingerprint, docs)
+                result["cache_path"] = str(cache_path)
+                print(f"  Saved processed data cache: {cache_path}")
+                pipeline.insert_documents(docs)
+
             moved_to = None
             if result["status"] == "completed" and config.move_processed_files:
                 moved_to = maybe_move_processed(path, processed_dir)

@@ -5,6 +5,7 @@
   "state_path": "state/podcast_rag_state.json",
   "stop_file": "state/stop_after_current.txt",
   "control_file": "state/pipeline_control.json",
+  "processed_data_dir": "processed_data",
   "move_processed_files": false,
   "persist_dir": "chroma_db_raptor_v2",
   "collection_name": "whisper_rag_v2",
