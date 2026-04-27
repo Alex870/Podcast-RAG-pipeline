@@ -5,6 +5,7 @@ param(
     [string]$FileGlob,
     [string]$Model,
     [string]$BaseUrl,
+    [int]$MaxParallelModelRequests,
     [switch]$OneFile,
     [switch]$CreateStopFile,
     [switch]$ClearStopFile,
@@ -173,6 +174,10 @@ if ($Model) {
 
 if ($BaseUrl) {
     $argsList += @("--base-url", $BaseUrl)
+}
+
+if ($MaxParallelModelRequests) {
+    $argsList += @("--max-parallel-model-requests", $MaxParallelModelRequests)
 }
 
 if ($OneFile) {

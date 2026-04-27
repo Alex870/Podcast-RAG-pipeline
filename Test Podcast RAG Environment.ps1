@@ -236,6 +236,7 @@ if ($configObject) {
     $statePath = Resolve-ProjectPath ([string]$configObject.state_path)
     $persistDir = Resolve-ProjectPath ([string]$configObject.persist_dir)
     $stopFile = Resolve-ProjectPath ([string]$configObject.stop_file)
+    $controlFile = Resolve-ProjectPath ([string]$configObject.control_file)
 
     if ($inputDir) {
         if (Test-Path -LiteralPath $inputDir) {
@@ -268,6 +269,26 @@ if ($configObject) {
         Write-Check -Status WARN -Name "Stop file" -Detail "A stop request is currently present: $stopFile"
     } elseif ($stopFile) {
         Write-Check -Status PASS -Name "Stop file" -Detail "No pending stop request at $stopFile"
+    }
+
+    if ($controlFile) {
+        $controlDir = Split-Path -Parent $controlFile
+        Test-WritableDirectory -Name "Control directory" -Path $controlDir
+        if (Test-Path -LiteralPath $controlFile) {
+            try {
+                $controlObject = Get-Content -LiteralPath $controlFile -Raw | ConvertFrom-Json
+                $parallel = if ($controlObject.max_parallel_model_requests) { [int]$controlObject.max_parallel_model_requests } else { 0 }
+                if ($parallel -ge 1) {
+                    Write-Check -Status PASS -Name "Live control file" -Detail ("{0}; max_parallel_model_requests={1}" -f $controlFile, $parallel)
+                } else {
+                    Write-Check -Status WARN -Name "Live control file" -Detail "File exists but max_parallel_model_requests is missing or invalid."
+                }
+            } catch {
+                Write-Check -Status WARN -Name "Live control file" -Detail ("Could not parse {0}: {1}" -f $controlFile, $_.Exception.Message)
+            }
+        } else {
+            Write-Check -Status WARN -Name "Live control file" -Detail "Will be created on the next pipeline run: $controlFile"
+        }
     }
 }
 

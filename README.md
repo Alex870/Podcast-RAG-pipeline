@@ -13,6 +13,7 @@ For overnight batch processing, local LM Studio processing is the sensible defau
 - `podcast_rag_pipeline.py`: main restartable Python pipeline
 - `Run Podcast RAG Pipeline.ps1`: Windows PowerShell launcher
 - `Test Podcast RAG Environment.ps1`: dependency and runtime diagnostic script
+- `Set Podcast RAG Control.ps1`: live control helper for active batch runs
 - `podcast_rag_config.example.json`: editable runtime configuration template
 - `environment.yml`: Miniconda/Conda environment definition
 - `podcast_rag_requirements.txt`: Python dependency list
@@ -59,20 +60,32 @@ Useful launcher parameters:
 .\Run Podcast RAG Pipeline.ps1 -Model "qwen3.6-35b-a3b"
 .\Run Podcast RAG Pipeline.ps1 -BaseUrl "http://127.0.0.1:1234/v1"
 .\Run Podcast RAG Pipeline.ps1 -OneFile
+.\Run Podcast RAG Pipeline.ps1 -MaxParallelModelRequests 2
 .\Run Podcast RAG Pipeline.ps1 -CreateStopFile
 .\Run Podcast RAG Pipeline.ps1 -ClearStopFile
 .\Run Podcast RAG Pipeline.ps1 -CondaEnvName "podcast-rag-pipeline"
 ```
 
+## Live Tuning
+
+The pipeline creates `state/pipeline_control.json` when it starts. While a batch is running, change how many new model requests can run in parallel with:
+
+```powershell
+.\Set Podcast RAG Control.ps1 -MaxParallelModelRequests 1
+.\Set Podcast RAG Control.ps1 -MaxParallelModelRequests 3
+```
+
+The new value is applied before the pipeline launches additional model requests. Already-running LM Studio requests are allowed to finish.
+
 ## Stopping After The Current File
 
-The pipeline checks for `state/stop_after_current.txt` between files. To request a clean stop, create that file while the batch is running:
+The pipeline checks for `state/stop_after_current.txt` between files and watches `Ctrl+C` while work is running. To request a clean stop from another PowerShell window, create the stop file while the batch is running:
 
 ```powershell
 .\Run Podcast RAG Pipeline.ps1 -CreateStopFile
 ```
 
-The current transcript will finish, state will be saved, and the next run will resume from the next unprocessed file. Pressing `Ctrl+C` also requests a clean stop when Python can receive the signal.
+On `Ctrl+C`, the pipeline stops launching new model requests, waits for in-flight request(s) to finish, saves state, and exits. A partially processed file is marked `interrupted` and will be retried on the next run. Completed files are skipped using `state/podcast_rag_state.json`.
 
 The stop file is intentionally left in place so the request is visible. Remove it before the next full run:
 

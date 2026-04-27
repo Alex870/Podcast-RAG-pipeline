@@ -11,7 +11,7 @@ import shutil
 import signal
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any
@@ -52,6 +52,7 @@ class PipelineConfig:
     processed_dir: str = "processed"
     state_path: str = "state/podcast_rag_state.json"
     stop_file: str = "state/stop_after_current.txt"
+    control_file: str = "state/pipeline_control.json"
     move_processed_files: bool = False
     persist_dir: str = "chroma_db_raptor_v2"
     collection_name: str = "whisper_rag_v2"
@@ -62,6 +63,8 @@ class PipelineConfig:
     verify_model: bool = True
     test_inference: bool = True
     max_threads: int = 2
+    max_parallel_model_requests: int = 2
+    performance_report_interval_seconds: int = 30
     max_levels: int = 4
     max_clusters: int = 300
     min_docs_to_cluster: int = 12
@@ -74,10 +77,88 @@ class PipelineConfig:
     llm_max_tokens: int = 1024
 
 
+class PipelineInterrupted(Exception):
+    pass
+
+
+class PerformanceTracker:
+    def __init__(self, report_interval_seconds: int):
+        self.report_interval_seconds = max(5, int(report_interval_seconds or 30))
+        self.started_at = time.time()
+        self.last_report_at = self.started_at
+        self.requests = 0
+        self.failures = 0
+        self.total_seconds = 0.0
+        self.approx_output_tokens = 0
+
+    def record_llm_result(self, label: str, elapsed: float, text: str) -> None:
+        self.requests += 1
+        self.total_seconds += elapsed
+        self.approx_output_tokens += max(1, len(text or "") // 4)
+        self.maybe_report(label)
+
+    def record_failure(self) -> None:
+        self.failures += 1
+        self.maybe_report("failure")
+
+    def maybe_report(self, label: str, force: bool = False) -> None:
+        now = time.time()
+        if not force and now - self.last_report_at < self.report_interval_seconds:
+            return
+
+        wall = max(0.001, now - self.started_at)
+        model_seconds = max(0.001, self.total_seconds)
+        req_per_min = self.requests / wall * 60.0
+        approx_tok_per_sec = self.approx_output_tokens / model_seconds
+        print(
+            "  perf: "
+            f"requests={self.requests}, failures={self.failures}, "
+            f"avg_request_seconds={self.total_seconds / max(1, self.requests):.1f}, "
+            f"requests_per_min={req_per_min:.2f}, "
+            f"approx_output_tokens_per_sec={approx_tok_per_sec:.1f}, "
+            f"last={label}"
+        )
+        self.last_report_at = now
+
+
+class RuntimeControl:
+    def __init__(self, config: PipelineConfig, project_dir: Path):
+        self.config = config
+        self.path = resolve_path(project_dir, config.control_file)
+        self.default_parallel = max(1, int(config.max_parallel_model_requests or config.max_threads or 1))
+        self.last_read_at = 0.0
+        self.cached_parallel = self.default_parallel
+
+    def ensure_file(self) -> None:
+        if self.path.exists():
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "max_parallel_model_requests": self.default_parallel,
+            "note": "Edit max_parallel_model_requests while the pipeline runs; new requests use the updated value.",
+        }
+        self.path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    def max_parallel_model_requests(self) -> int:
+        now = time.time()
+        if now - self.last_read_at < 2:
+            return self.cached_parallel
+        self.last_read_at = now
+
+        try:
+            if self.path.exists():
+                payload = json.loads(self.path.read_text(encoding="utf-8"))
+                value = int(payload.get("max_parallel_model_requests", self.default_parallel))
+                self.cached_parallel = max(1, min(64, value))
+        except Exception as exc:
+            print(f"  control file read failed; using {self.cached_parallel}: {exc}")
+        return self.cached_parallel
+
+
 def request_stop(signum, frame):
     global STOP_REQUESTED
     STOP_REQUESTED = True
-    print("\nStop requested. The current file will finish, then the batch will stop cleanly.")
+    print("\nStop requested. No new model requests will be started; waiting for in-flight request(s) to finish.")
 
 
 def resolve_path(base_dir: Path, value: str) -> Path:
@@ -192,6 +273,8 @@ def extract_json_payload(text: str) -> Any:
 
 def with_retry(func, label: str, retries: int = 3, delay: int = 1):
     for attempt in range(retries):
+        if STOP_REQUESTED:
+            raise PipelineInterrupted("Stop requested before retrying a model request.")
         try:
             return func()
         except Exception:
@@ -299,6 +382,9 @@ class PodcastRagPipeline:
     def __init__(self, config: PipelineConfig, project_dir: Path):
         self.config = config
         self.project_dir = project_dir
+        self.control = RuntimeControl(config, project_dir)
+        self.control.ensure_file()
+        self.performance = PerformanceTracker(config.performance_report_interval_seconds)
         self.embeddings = HuggingFaceEmbeddings(model_name=config.embedding_model)
         self.llm = ChatOpenAI(
             model=config.lm_studio_model,
@@ -369,6 +455,20 @@ class PodcastRagPipeline:
 
     def make_chain(self, prompt):
         return prompt | self.llm | StrOutputParser()
+
+    def invoke_llm(self, chain, text: str, label: str) -> str:
+        if STOP_REQUESTED:
+            raise PipelineInterrupted("Stop requested before starting another model request.")
+
+        start = time.time()
+        try:
+            result = with_retry(lambda: chain.invoke({"text": text}), label)
+        except Exception:
+            self.performance.record_failure()
+            raise
+
+        self.performance.record_llm_result(label, time.time() - start, result)
+        return result
 
     def normalize_doc(self, doc: Document, source: str, index: int) -> Document:
         metadata = dict(doc.metadata or {})
@@ -463,7 +563,7 @@ class PodcastRagPipeline:
         while True:
             joined = "\n\n".join(pending)
             if len(pending) == 1 and len(joined) <= self.config.rollup_char_budget:
-                return with_retry(lambda: chain.invoke({"text": joined}), label)
+                return self.invoke_llm(chain, joined, label)
 
             batches = []
             current_batch = []
@@ -484,7 +584,9 @@ class PodcastRagPipeline:
 
             reduced = []
             for idx, batch in enumerate(batches):
-                reduced.append(with_retry(lambda batch=batch: chain.invoke({"text": batch}), f"{label} batch {idx + 1}"))
+                if STOP_REQUESTED:
+                    raise PipelineInterrupted("Stop requested before starting another model request.")
+                reduced.append(self.invoke_llm(chain, batch, f"{label} batch {idx + 1}"))
 
             if len(reduced) == 1:
                 return reduced[0]
@@ -587,12 +689,33 @@ class PodcastRagPipeline:
 
             summaries = []
             start_time = time.time()
-            with ThreadPoolExecutor(max_workers=self.config.max_threads) as executor:
-                futures = [executor.submit(self.summarize_cluster, level, cluster_docs, source) for cluster_docs in clusters]
-                for idx, future in enumerate(as_completed(futures), 1):
-                    summaries.append(future.result())
-                    elapsed = dt.timedelta(seconds=int(time.time() - start_time))
-                    print(f"  [{idx:2d}/{len(futures)}] built L{level} summary nodes elapsed={elapsed}")
+            completed = 0
+            pending_clusters = list(clusters)
+            running = set()
+
+            with ThreadPoolExecutor(max_workers=64) as executor:
+                while pending_clusters or running:
+                    while pending_clusters and not STOP_REQUESTED and len(running) < self.control.max_parallel_model_requests():
+                        cluster_docs = pending_clusters.pop(0)
+                        running.add(executor.submit(self.summarize_cluster, level, cluster_docs, source))
+
+                    if not running:
+                        break
+
+                    done, running = wait(running, timeout=1, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        summaries.append(future.result())
+                        completed += 1
+                        elapsed = dt.timedelta(seconds=int(time.time() - start_time))
+                        live_limit = self.control.max_parallel_model_requests()
+                        print(
+                            f"  [{completed:2d}/{len(clusters)}] built L{level} summary nodes "
+                            f"elapsed={elapsed} in_flight={len(running)} live_parallel={live_limit}"
+                        )
+                        self.performance.maybe_report(f"L{level} summary", force=False)
+
+                    if STOP_REQUESTED and not running:
+                        raise PipelineInterrupted("Stop requested after in-flight model requests completed.")
 
             all_nodes.extend(summaries)
             latest_summaries = summaries
@@ -658,7 +781,7 @@ class PodcastRagPipeline:
         source_docs = self.build_position_source_docs(all_nodes, thesis_doc)
         prompt_text = "\n".join(self.render_position_passage(doc) for doc in source_docs)
 
-        raw = with_retry(lambda: self.position_chain.invoke({"text": prompt_text}), "position extraction")
+        raw = self.invoke_llm(self.position_chain, prompt_text, "position extraction")
         payload = extract_json_payload(raw)
         positions = payload.get("positions") if isinstance(payload, dict) else payload
         if not isinstance(positions, list):
@@ -753,6 +876,7 @@ class PodcastRagPipeline:
 
         ids = [doc.metadata["node_id"] for doc in all_nodes]
         self.vectorstore.add_documents(self.sanitize_documents(all_nodes), ids=ids)
+        self.performance.maybe_report("file complete", force=True)
         return {"status": "completed", "nodes": len(all_nodes), "position_cards": len(position_docs), "elapsed_seconds": int(time.time() - start)}
 
 
@@ -829,6 +953,11 @@ def run_batch(config: PipelineConfig, project_dir: Path, one_file: bool) -> int:
                 result["moved_to"] = moved_to
             mark_state(state, fingerprint, path, result["status"], result)
             save_state(state_path, state)
+        except PipelineInterrupted as exc:
+            mark_state(state, fingerprint, path, "interrupted", {"error": str(exc)})
+            save_state(state_path, state)
+            print("Stop request handled. Progress state was saved; this file will be retried on the next run.")
+            break
         except Exception as exc:
             mark_state(state, fingerprint, path, "failed", {"error": f"{type(exc).__name__}: {exc}"})
             save_state(state_path, state)
@@ -861,6 +990,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--file-glob", help="Override config file_glob.")
     parser.add_argument("--model", help="Override config lm_studio_model.")
     parser.add_argument("--base-url", help="Override config lm_studio_base_url.")
+    parser.add_argument("--max-parallel-model-requests", type=int, help="Override initial max_parallel_model_requests.")
     parser.add_argument("--one-file", action="store_true", help="Process only one pending file.")
     parser.add_argument("--create-stop-file", action="store_true", help="Create the configured stop file and exit.")
     return parser.parse_args()
@@ -883,6 +1013,8 @@ def main() -> int:
         config.lm_studio_model = args.model
     if args.base_url:
         config.lm_studio_base_url = args.base_url
+    if args.max_parallel_model_requests:
+        config.max_parallel_model_requests = args.max_parallel_model_requests
 
     if args.create_stop_file:
         return create_stop_file(config, project_dir)
