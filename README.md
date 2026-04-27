@@ -68,7 +68,7 @@ Useful launcher parameters:
 
 ## Live Tuning
 
-The pipeline creates `state/pipeline_control.json` when it starts. While a batch is running, change how many new model requests can run in parallel with:
+At startup, the pipeline initializes `state/pipeline_control.json` from `max_parallel_model_requests` in `podcast_rag_config.json` or the `-MaxParallelModelRequests` launcher override. While a batch is running, change how many new model requests can run in parallel with:
 
 ```powershell
 .\Set Podcast RAG Control.ps1 -MaxParallelModelRequests 1

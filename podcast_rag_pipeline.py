@@ -129,15 +129,16 @@ class RuntimeControl:
         self.last_read_at = 0.0
         self.cached_parallel = self.default_parallel
 
-    def ensure_file(self) -> None:
-        if self.path.exists():
-            return
+    def initialize_file_for_run(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "max_parallel_model_requests": self.default_parallel,
-            "note": "Edit max_parallel_model_requests while the pipeline runs; new requests use the updated value.",
+            "initialized_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "note": "Initialized from config at pipeline startup. Edit max_parallel_model_requests while the pipeline runs; new requests use the updated value.",
         }
         self.path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        self.cached_parallel = self.default_parallel
+        print(f"Live control initialized: {self.path} max_parallel_model_requests={self.default_parallel}")
 
     def max_parallel_model_requests(self) -> int:
         now = time.time()
@@ -379,11 +380,10 @@ def load_transcript_json(path: Path) -> list[Document]:
 
 
 class PodcastRagPipeline:
-    def __init__(self, config: PipelineConfig, project_dir: Path):
+    def __init__(self, config: PipelineConfig, project_dir: Path, control: RuntimeControl):
         self.config = config
         self.project_dir = project_dir
-        self.control = RuntimeControl(config, project_dir)
-        self.control.ensure_file()
+        self.control = control
         self.performance = PerformanceTracker(config.performance_report_interval_seconds)
         self.embeddings = HuggingFaceEmbeddings(model_name=config.embedding_model)
         self.llm = ChatOpenAI(
@@ -914,6 +914,8 @@ def run_batch(config: PipelineConfig, project_dir: Path, one_file: bool) -> int:
     input_dir.mkdir(parents=True, exist_ok=True)
     processed_dir.mkdir(parents=True, exist_ok=True)
     stop_file.parent.mkdir(parents=True, exist_ok=True)
+    control = RuntimeControl(config, project_dir)
+    control.initialize_file_for_run()
 
     if config.verify_model:
         verify_model_available(config)
@@ -932,7 +934,7 @@ def run_batch(config: PipelineConfig, project_dir: Path, one_file: bool) -> int:
     if not pending:
         return 0
 
-    pipeline = PodcastRagPipeline(config, project_dir)
+    pipeline = PodcastRagPipeline(config, project_dir, control)
 
     for idx, (path, fingerprint) in enumerate(pending, 1):
         if STOP_REQUESTED or stop_file.exists():
