@@ -28,5 +28,5 @@
   "leaf_chunk_overlap": 250,
   "max_position_source_docs": 40,
   "embedding_batch_size": 64,
-  "llm_max_tokens": 2048
+  "llm_max_tokens": 4096
 }

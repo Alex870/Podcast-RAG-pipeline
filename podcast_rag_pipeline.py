@@ -76,7 +76,7 @@ class PipelineConfig:
     leaf_chunk_overlap: int = 250
     max_position_source_docs: int = 40
     embedding_batch_size: int = 64
-    llm_max_tokens: int = 2048
+    llm_max_tokens: int = 4096
 
 
 class PipelineInterrupted(Exception):

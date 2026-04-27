@@ -110,6 +110,8 @@ To scan existing caches for missing-context LLM responses:
 
 Rejected LLM responses and fallback events are written to `debug_output` as JSON files containing the label, source prompt text, model response, and error reason. These files are ignored by Git.
 
+For Qwen reasoning models in LM Studio, keep `llm_max_tokens` high enough for hidden reasoning plus final answer text. With `unsloth/qwen3.6-35b-a3b`, `4096` has been more reliable than `2048` even when `/no_think` is present.
+
 By default, input JSON files are not moved after processing. Set `move_processed_files` to `true` if you prefer the older workflow where processed files are moved to `processed`.
 
 ## Direct Python Usage
