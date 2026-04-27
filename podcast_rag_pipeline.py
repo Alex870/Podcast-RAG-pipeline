@@ -1013,6 +1013,21 @@ def processed_data_cache_path(processed_data_dir: Path, fingerprint: str, source
     return processed_data_dir / f"{safe_stem}.{fingerprint}.processed_documents.json"
 
 
+def quarantine_invalid_cache(cache_path: Path, reason: str) -> Path:
+    quarantine_dir = cache_path.parent / "invalid"
+    quarantine_dir.mkdir(parents=True, exist_ok=True)
+    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    dest = quarantine_dir / f"{cache_path.name}.invalid.{stamp}"
+    counter = 1
+    while dest.exists():
+        dest = quarantine_dir / f"{cache_path.name}.invalid.{stamp}.{counter}"
+        counter += 1
+    shutil.move(str(cache_path), str(dest))
+    reason_path = dest.with_suffix(dest.suffix + ".reason.txt")
+    reason_path.write_text(reason, encoding="utf-8")
+    return dest
+
+
 def mark_state(state: dict[str, Any], fingerprint: str, path: Path, status: str, extra: dict[str, Any] | None = None) -> None:
     payload = {
         "path": str(path),
@@ -1085,7 +1100,25 @@ def run_batch(config: PipelineConfig, project_dir: Path, one_file: bool) -> int:
 
         try:
             if cache_path.exists():
-                result = pipeline.insert_cached_file(path, fingerprint, cache_path)
+                try:
+                    result = pipeline.insert_cached_file(path, fingerprint, cache_path)
+                except ValueError as exc:
+                    quarantined_path = quarantine_invalid_cache(cache_path, str(exc))
+                    print(f"  Invalid processed data cache moved to: {quarantined_path}")
+                    print("  Rebuilding processed data from transcript.")
+                    mark_state(state, fingerprint, path, "in_progress")
+                    save_state(state_path, state)
+                    result = pipeline.process_file(path)
+                    if result["status"] != "completed":
+                        mark_state(state, fingerprint, path, result["status"], result)
+                        save_state(state_path, state)
+                        continue
+                    docs = result.pop("documents", [])
+                    pipeline.save_cached_documents(cache_path, path, fingerprint, docs)
+                    result["cache_path"] = str(cache_path)
+                    result["quarantined_cache_path"] = str(quarantined_path)
+                    print(f"  Saved processed data cache: {cache_path}")
+                    pipeline.insert_documents(docs)
             else:
                 mark_state(state, fingerprint, path, "in_progress")
                 save_state(state_path, state)
