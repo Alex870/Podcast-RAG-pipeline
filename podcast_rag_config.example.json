@@ -23,10 +23,10 @@
   "max_clusters": 300,
   "min_docs_to_cluster": 12,
   "group_fallback_size": 6,
-  "rollup_char_budget": 12000,
+  "rollup_char_budget": 6000,
   "leaf_chunk_size": 1800,
   "leaf_chunk_overlap": 250,
   "max_position_source_docs": 40,
   "embedding_batch_size": 64,
-  "llm_max_tokens": 1024
+  "llm_max_tokens": 2048
 }

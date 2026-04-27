@@ -71,12 +71,12 @@ class PipelineConfig:
     max_clusters: int = 300
     min_docs_to_cluster: int = 12
     group_fallback_size: int = 6
-    rollup_char_budget: int = 12000
+    rollup_char_budget: int = 6000
     leaf_chunk_size: int = 1800
     leaf_chunk_overlap: int = 250
     max_position_source_docs: int = 40
     embedding_batch_size: int = 64
-    llm_max_tokens: int = 1024
+    llm_max_tokens: int = 2048
 
 
 class PipelineInterrupted(Exception):
@@ -336,6 +336,53 @@ def fallback_summary_from_text(text: str, label: str, max_chars: int = 1800) -> 
     )
 
 
+def extract_llm_text(response: Any) -> str:
+    if isinstance(response, str):
+        return response
+
+    content = getattr(response, "content", None)
+    if isinstance(content, str) and content.strip():
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                text = item.get("text") or item.get("content")
+                if isinstance(text, str):
+                    parts.append(text)
+        joined = "\n".join(part for part in parts if part.strip())
+        if joined.strip():
+            return joined
+
+    additional_kwargs = getattr(response, "additional_kwargs", {}) or {}
+    for key in ("reasoning_content", "reasoning", "thinking", "thoughts"):
+        value = additional_kwargs.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+
+    response_metadata = getattr(response, "response_metadata", {}) or {}
+    for key in ("reasoning_content", "reasoning", "thinking", "thoughts"):
+        value = response_metadata.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+
+    return ""
+
+
+def serialize_llm_response(response: Any) -> Any:
+    if isinstance(response, (str, int, float, bool)) or response is None:
+        return response
+    payload = {
+        "type": type(response).__name__,
+        "content": getattr(response, "content", None),
+        "additional_kwargs": getattr(response, "additional_kwargs", None),
+        "response_metadata": getattr(response, "response_metadata", None),
+    }
+    return payload
+
+
 def verify_model_available(config: PipelineConfig) -> None:
     client = OpenAI(base_url=config.lm_studio_base_url, api_key=config.lm_studio_api_key)
     models = [model.id for model in client.models.list().data]
@@ -458,7 +505,7 @@ class PodcastRagPipeline:
                         "and the context needed to answer future questions accurately. Avoid filler. "
                         "Return a non-empty final answer in the assistant message content. Do not ask for more source text.",
                     ),
-                    ("user", "/no_think\nThe source material to summarize is included below between delimiters.\n\n<<<SOURCE_MATERIAL>>>\n{text}\n<<<END_SOURCE_MATERIAL>>>\n\nSummarize only the provided source material for retrieval. Return the final summary now."),
+                    ("user", "The source material to summarize is included below between delimiters.\n\n<<<SOURCE_MATERIAL>>>\n{text}\n<<<END_SOURCE_MATERIAL>>>\n\nSummarize only the provided source material for retrieval. Return the final summary now.\n/no_think"),
                 ]
             )
         )
@@ -471,7 +518,7 @@ class PodcastRagPipeline:
                         "normative commitments, policy preferences, key uncertainties, and notable counterarguments. "
                         "Return a non-empty final answer in the assistant message content. Do not ask for more source text.",
                     ),
-                    ("user", "/no_think\nThe episode source material is included below between delimiters.\n\n<<<SOURCE_MATERIAL>>>\n{text}\n<<<END_SOURCE_MATERIAL>>>\n\nCreate an episode thesis summary using only the provided source material. Return the final summary now."),
+                    ("user", "The episode source material is included below between delimiters.\n\n<<<SOURCE_MATERIAL>>>\n{text}\n<<<END_SOURCE_MATERIAL>>>\n\nCreate an episode thesis summary using only the provided source material. Return the final summary now.\n/no_think"),
                 ]
             )
         )
@@ -487,11 +534,10 @@ class PodcastRagPipeline:
                     ),
                     (
                         "user",
-                        "/no_think\n"
                         'Return a JSON object with key "positions". Each position must be an object with keys: '
                         '"claim", "speaker", "stance_category", "confidence", "rationale", "counterpoints", '
                         '"evidence_node_ids", "evidence_timestamps", and "keywords".\n\n'
-                        "Use only evidence from the passages below.\n\n{text}",
+                        "Use only evidence from the passages below.\n\n{text}\n/no_think",
                     ),
                 ]
             )
@@ -503,7 +549,7 @@ class PodcastRagPipeline:
         )
 
     def make_chain(self, prompt):
-        return prompt | self.llm | StrOutputParser()
+        return prompt | self.llm
 
     def write_llm_debug_event(
         self,
@@ -512,6 +558,7 @@ class PodcastRagPipeline:
         prompt_text: str,
         response_text: str | None = None,
         error: str | None = None,
+        raw_response: Any = None,
     ) -> Path:
         safe_label = re.sub(r"[^A-Za-z0-9_.-]+", "_", label).strip("._") or "llm"
         stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -528,6 +575,7 @@ class PodcastRagPipeline:
             "error": error,
             "prompt_text": prompt_text,
             "response_text": response_text,
+            "raw_response": serialize_llm_response(raw_response),
         }
         path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
         return path
@@ -541,7 +589,8 @@ class PodcastRagPipeline:
         start = time.time()
         try:
             def run_and_validate():
-                candidate = chain.invoke({"text": text})
+                raw_candidate = chain.invoke({"text": text})
+                candidate = extract_llm_text(raw_candidate)
                 if not has_substantive_text(candidate, min_chars=1):
                     debug_path = self.write_llm_debug_event(
                         label=label,
@@ -549,6 +598,7 @@ class PodcastRagPipeline:
                         prompt_text=text,
                         response_text=candidate,
                         error="Model returned empty assistant message content.",
+                        raw_response=raw_candidate,
                     )
                     print(f"  debug saved: {debug_path}")
                     raise EmptyLLMResponse(f"{label} returned an empty response.")
@@ -559,6 +609,7 @@ class PodcastRagPipeline:
                         prompt_text=text,
                         response_text=candidate,
                         error="Response looked like the model was asking for source text that was already provided.",
+                        raw_response=raw_candidate,
                     )
                     print(f"  debug saved: {debug_path}")
                     raise MissingContextResponse(f"{label} returned a missing-context response instead of a summary.")
