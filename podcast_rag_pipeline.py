@@ -54,6 +54,7 @@ class PipelineConfig:
     stop_file: str = "state/stop_after_current.txt"
     control_file: str = "state/pipeline_control.json"
     processed_data_dir: str = "processed_data"
+    debug_output_dir: str = "debug_output"
     move_processed_files: bool = False
     persist_dir: str = "chroma_db_raptor_v2"
     collection_name: str = "whisper_rag_v2"
@@ -313,16 +314,12 @@ def is_missing_context_response(text: str) -> bool:
     compact = re.sub(r"\s+", " ", text or "").strip().lower()
     if not compact:
         return True
-    patterns = [
-        "please provide the podcast transcript",
-        "please provide the transcript",
-        "please provide the source text",
-        "once shared",
-        "once you share",
-        "i'll generate",
-        "i can summarize",
-    ]
-    return any(pattern in compact for pattern in patterns)
+    asks_for_missing_input = (
+        ("please provide" in compact or "please share" in compact or "send me" in compact)
+        and any(term in compact for term in ["transcript", "source text", "source material", "podcast text", "material"])
+    )
+    deferred_until_shared = any(pattern in compact for pattern in ["once shared", "once you share", "when you provide"])
+    return asks_for_missing_input or deferred_until_shared
 
 
 def fallback_summary_from_text(text: str, label: str, max_chars: int = 1800) -> str:
@@ -426,6 +423,8 @@ class PodcastRagPipeline:
         self.config = config
         self.project_dir = project_dir
         self.control = control
+        self.debug_output_dir = resolve_path(project_dir, config.debug_output_dir)
+        self.debug_output_dir.mkdir(parents=True, exist_ok=True)
         self.performance = PerformanceTracker(config.performance_report_interval_seconds)
         self.embeddings = HuggingFaceEmbeddings(model_name=config.embedding_model)
         self.llm = ChatOpenAI(
@@ -498,6 +497,33 @@ class PodcastRagPipeline:
     def make_chain(self, prompt):
         return prompt | self.llm | StrOutputParser()
 
+    def write_llm_debug_event(
+        self,
+        label: str,
+        event: str,
+        prompt_text: str,
+        response_text: str | None = None,
+        error: str | None = None,
+    ) -> Path:
+        safe_label = re.sub(r"[^A-Za-z0-9_.-]+", "_", label).strip("._") or "llm"
+        stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        path = self.debug_output_dir / f"{stamp}.{safe_label}.{uuid.uuid4().hex[:8]}.json"
+        payload = {
+            "version": 1,
+            "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "event": event,
+            "label": label,
+            "model": self.config.lm_studio_model,
+            "base_url": self.config.lm_studio_base_url,
+            "prompt_char_count": len(prompt_text or ""),
+            "response_char_count": len(response_text or ""),
+            "error": error,
+            "prompt_text": prompt_text,
+            "response_text": response_text,
+        }
+        path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
+        return path
+
     def invoke_llm(self, chain, text: str, label: str) -> str:
         if STOP_REQUESTED:
             raise PipelineInterrupted("Stop requested before starting another model request.")
@@ -509,6 +535,14 @@ class PodcastRagPipeline:
             def run_and_validate():
                 candidate = chain.invoke({"text": text})
                 if is_missing_context_response(candidate):
+                    debug_path = self.write_llm_debug_event(
+                        label=label,
+                        event="missing_context_response",
+                        prompt_text=text,
+                        response_text=candidate,
+                        error="Response looked like the model was asking for source text that was already provided.",
+                    )
+                    print(f"  debug saved: {debug_path}")
                     raise MissingContextResponse(f"{label} returned a missing-context response instead of a summary.")
                 return candidate
 
@@ -520,8 +554,23 @@ class PodcastRagPipeline:
                 return '{"positions": []}'
             print(f"  {label} returned missing-context responses; using fallback extractive summary.")
             result = fallback_summary_from_text(text, label)
+            debug_path = self.write_llm_debug_event(
+                label=label,
+                event="fallback_extractive_summary",
+                prompt_text=text,
+                response_text=result,
+                error="All retries returned missing-context responses.",
+            )
+            print(f"  debug saved: {debug_path}")
         except Exception:
             self.performance.record_failure()
+            debug_path = self.write_llm_debug_event(
+                label=label,
+                event="llm_exception",
+                prompt_text=text,
+                error="LLM request failed before a valid response was accepted.",
+            )
+            print(f"  debug saved: {debug_path}")
             raise
 
         self.performance.record_llm_result(label, time.time() - start, result)

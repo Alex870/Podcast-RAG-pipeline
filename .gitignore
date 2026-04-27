@@ -3,6 +3,7 @@ podcast_rag_config.json
 data/
 processed/
 processed_data/
+debug_output/
 chroma_db*/
 state/
 logs/

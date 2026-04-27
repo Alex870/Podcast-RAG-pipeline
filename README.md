@@ -108,6 +108,8 @@ To scan existing caches for missing-context LLM responses:
 .\Test Processed Data Cache.ps1
 ```
 
+Rejected LLM responses and fallback events are written to `debug_output` as JSON files containing the label, source prompt text, model response, and error reason. These files are ignored by Git.
+
 By default, input JSON files are not moved after processing. Set `move_processed_files` to `true` if you prefer the older workflow where processed files are moved to `processed`.
 
 ## Direct Python Usage
