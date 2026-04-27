@@ -174,7 +174,13 @@ def load_config(config_path: Path) -> PipelineConfig:
     if not config_path.exists():
         return PipelineConfig()
 
-    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    try:
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise SystemExit(
+            f"Invalid JSON in config file: {config_path}\n"
+            f"Line {exc.lineno}, column {exc.colno}: {exc.msg}"
+        ) from exc
     allowed = {field.name for field in fields(PipelineConfig)}
     values = {key: value for key, value in payload.items() if key in allowed}
     return PipelineConfig(**values)
