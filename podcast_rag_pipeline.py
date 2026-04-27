@@ -78,6 +78,7 @@ class PipelineConfig:
     embedding_batch_size: int = 64
     llm_max_tokens: int = 4096
     max_reduction_rounds: int = 8
+    summary_target_chars: int = 1600
 
 
 class PipelineInterrupted(Exception):
@@ -337,6 +338,24 @@ def fallback_summary_from_text(text: str, label: str, max_chars: int = 1800) -> 
     )
 
 
+def clip_text(text: str, max_chars: int) -> str:
+    compact = re.sub(r"\s+", " ", text or "").strip()
+    if len(compact) <= max_chars:
+        return compact
+    boundary = max(compact.rfind(". ", 0, max_chars), compact.rfind("; ", 0, max_chars), compact.rfind(", ", 0, max_chars))
+    if boundary < int(max_chars * 0.55):
+        boundary = max_chars
+    return compact[:boundary].rstrip(" .,;:") + "..."
+
+
+def compact_reduced_summaries(summaries: list[str], label: str, max_chars: int) -> str:
+    parts = [re.sub(r"\s+", " ", summary or "").strip() for summary in summaries if has_substantive_text(summary, min_chars=1)]
+    if not parts:
+        raise ValueError(f"{label} had no reduced summaries to compact.")
+    combined = " ".join(parts)
+    return f"Deterministic compacted summary for {label}: {clip_text(combined, max_chars)}"
+
+
 def text_fingerprint(values: list[str]) -> str:
     payload = "\n\n".join(re.sub(r"\s+", " ", value or "").strip() for value in values)
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()
@@ -511,7 +530,7 @@ class PodcastRagPipeline:
                         "and the context needed to answer future questions accurately. Avoid filler. "
                         "Return a non-empty final answer in the assistant message content. Do not ask for more source text.",
                     ),
-                    ("user", f"The source material to summarize is included below between delimiters.\n\n<<<SOURCE_MATERIAL>>>\n{{text}}\n<<<END_SOURCE_MATERIAL>>>\n\nSummarize only the provided source material for retrieval. Return the final summary now.{self.thinking_control_suffix()}"),
+                    ("user", f"The source material to summarize is included below between delimiters.\n\n<<<SOURCE_MATERIAL>>>\n{{text}}\n<<<END_SOURCE_MATERIAL>>>\n\nSummarize only the provided source material for retrieval. Return 5-10 dense bullets, no preamble, no repeated headings, and stay under {self.config.summary_target_chars} characters. Return the final summary now.{self.thinking_control_suffix()}"),
                 ]
             )
         )
@@ -524,7 +543,7 @@ class PodcastRagPipeline:
                         "normative commitments, policy preferences, key uncertainties, and notable counterarguments. "
                         "Return a non-empty final answer in the assistant message content. Do not ask for more source text.",
                     ),
-                    ("user", f"The episode source material is included below between delimiters.\n\n<<<SOURCE_MATERIAL>>>\n{{text}}\n<<<END_SOURCE_MATERIAL>>>\n\nCreate an episode thesis summary using only the provided source material. Return the final summary now.{self.thinking_control_suffix()}"),
+                    ("user", f"The episode source material is included below between delimiters.\n\n<<<SOURCE_MATERIAL>>>\n{{text}}\n<<<END_SOURCE_MATERIAL>>>\n\nCreate an episode thesis summary using only the provided source material. Return dense bullets, no preamble, no repeated headings, and stay under {self.config.summary_target_chars * 2} characters. Return the final summary now.{self.thinking_control_suffix()}"),
                 ]
             )
         )
@@ -822,9 +841,9 @@ class PodcastRagPipeline:
                         f"{len(reduced)} block(s), {reduced_total_chars} chars."
                     ),
                 )
-                print(f"  {label} reduction stalled; using deterministic fallback summary.")
+                print(f"  {label} reduction stalled; compacting reduced summaries deterministically.")
                 print(f"  debug saved: {debug_path}")
-                return fallback_summary_from_text(original_text, label, max_chars=min(2400, self.config.rollup_char_budget))
+                return compact_reduced_summaries(reduced, label, max_chars=min(self.config.rollup_char_budget, self.config.summary_target_chars * 2))
 
             seen_fingerprints.add(reduced_fingerprint)
             previous_total_chars = reduced_total_chars
@@ -837,9 +856,9 @@ class PodcastRagPipeline:
             response_text="\n\n".join(pending),
             error=f"Reduction exceeded max_reduction_rounds={self.config.max_reduction_rounds}.",
         )
-        print(f"  {label} reached reduction round limit; using deterministic fallback summary.")
+        print(f"  {label} reached reduction round limit; compacting reduced summaries deterministically.")
         print(f"  debug saved: {debug_path}")
-        return fallback_summary_from_text(original_text, label, max_chars=min(2400, self.config.rollup_char_budget))
+        return compact_reduced_summaries(pending, label, max_chars=min(self.config.rollup_char_budget, self.config.summary_target_chars * 2))
 
     def summarize_documents(self, docs: list[Document], chain, label: str) -> str:
         source_docs = [doc for doc in docs if has_substantive_text(doc.page_content, min_chars=20)]

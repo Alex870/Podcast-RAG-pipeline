@@ -25,6 +25,7 @@
   "group_fallback_size": 6,
   "rollup_char_budget": 6000,
   "max_reduction_rounds": 8,
+  "summary_target_chars": 1600,
   "leaf_chunk_size": 1800,
   "leaf_chunk_overlap": 250,
   "max_position_source_docs": 40,
