@@ -82,6 +82,10 @@ class PipelineInterrupted(Exception):
     pass
 
 
+class MissingContextResponse(Exception):
+    pass
+
+
 class PerformanceTracker:
     def __init__(self, report_interval_seconds: int):
         self.report_interval_seconds = max(5, int(report_interval_seconds or 30))
@@ -321,6 +325,16 @@ def is_missing_context_response(text: str) -> bool:
     return any(pattern in compact for pattern in patterns)
 
 
+def fallback_summary_from_text(text: str, label: str, max_chars: int = 1800) -> str:
+    compact = re.sub(r"\s+", " ", text or "").strip()
+    if not compact:
+        raise ValueError(f"{label} had no source text for fallback summary.")
+    return (
+        f"Fallback extractive summary for {label}: "
+        f"{short_text(compact, max_chars=max_chars)}"
+    )
+
+
 def verify_model_available(config: PipelineConfig) -> None:
     client = OpenAI(base_url=config.lm_studio_base_url, api_key=config.lm_studio_api_key)
     models = [model.id for model in client.models.list().data]
@@ -440,7 +454,7 @@ class PodcastRagPipeline:
                         "Emphasize durable beliefs, recurring arguments, values, causal explanations, disagreements, "
                         "and the context needed to answer future questions accurately. Avoid filler.",
                     ),
-                    ("user", "Summarize this material for retrieval:\n\n{text}"),
+                    ("user", "The source material to summarize is included below between delimiters.\n\n<<<SOURCE_MATERIAL>>>\n{text}\n<<<END_SOURCE_MATERIAL>>>\n\nSummarize only the provided source material for retrieval."),
                 ]
             )
         )
@@ -452,7 +466,7 @@ class PodcastRagPipeline:
                         "You are distilling an episode-level worldview summary. Extract the central theses, recurring positions, "
                         "normative commitments, policy preferences, key uncertainties, and notable counterarguments.",
                     ),
-                    ("user", "Create an episode thesis summary from this material:\n\n{text}"),
+                    ("user", "The episode source material is included below between delimiters.\n\n<<<SOURCE_MATERIAL>>>\n{text}\n<<<END_SOURCE_MATERIAL>>>\n\nCreate an episode thesis summary using only the provided source material."),
                 ]
             )
         )
@@ -495,10 +509,17 @@ class PodcastRagPipeline:
             def run_and_validate():
                 candidate = chain.invoke({"text": text})
                 if is_missing_context_response(candidate):
-                    raise ValueError(f"{label} returned a missing-context response instead of a summary.")
+                    raise MissingContextResponse(f"{label} returned a missing-context response instead of a summary.")
                 return candidate
 
             result = with_retry(run_and_validate, label)
+        except MissingContextResponse:
+            self.performance.record_failure()
+            if "position extraction" in label:
+                print(f"  {label} returned missing-context responses; using empty position list.")
+                return '{"positions": []}'
+            print(f"  {label} returned missing-context responses; using fallback extractive summary.")
+            result = fallback_summary_from_text(text, label)
         except Exception:
             self.performance.record_failure()
             raise
@@ -634,7 +655,10 @@ class PodcastRagPipeline:
             pending = reduced
 
     def summarize_documents(self, docs: list[Document], chain, label: str) -> str:
-        blocks = [self.render_doc_for_rollup(doc) for doc in docs]
+        source_docs = [doc for doc in docs if has_substantive_text(doc.page_content, min_chars=20)]
+        if not source_docs:
+            raise ValueError(f"{label} had no substantive document content to summarize.")
+        blocks = [self.render_doc_for_rollup(doc) for doc in source_docs]
         return self.reduce_text_blocks(blocks, chain, label)
 
     def embed_in_batches(self, texts: list[str]) -> list[list[float]]:
