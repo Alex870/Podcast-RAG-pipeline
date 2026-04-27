@@ -27,7 +27,6 @@ function Invoke-ProjectPython {
     )
 
     & conda run --no-capture-output -n $CondaEnvName python @Arguments
-    return $LASTEXITCODE
 }
 
 function Test-CondaEnv {
@@ -60,7 +59,8 @@ function New-ProjectCondaEnv {
 }
 
 function Test-PythonDependencies {
-    $dependencyCheck = @"
+    $dependencyCheckPath = Join-Path ([System.IO.Path]::GetTempPath()) ("podcast_rag_dependency_check_{0}.py" -f [guid]::NewGuid().ToString("N"))
+    @"
 import importlib
 import sys
 
@@ -85,10 +85,14 @@ for name in required:
 if missing:
     print('MISSING:' + '|'.join(missing))
     sys.exit(1)
-"@
+"@ | Set-Content -LiteralPath $dependencyCheckPath -Encoding UTF8
 
-    Invoke-ProjectPython -Arguments @("-c", $dependencyCheck)
-    return $LASTEXITCODE
+    try {
+        Invoke-ProjectPython -Arguments @($dependencyCheckPath)
+        return $LASTEXITCODE
+    } finally {
+        Remove-Item -LiteralPath $dependencyCheckPath -Force -ErrorAction SilentlyContinue
+    }
 }
 
 if (-not (Get-Command conda -ErrorAction SilentlyContinue)) {

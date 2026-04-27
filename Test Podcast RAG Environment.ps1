@@ -174,7 +174,8 @@ if ($condaEnvFound) {
         }
     }
 
-    $dependencyCheck = @"
+    $dependencyCheckPath = Join-Path ([System.IO.Path]::GetTempPath()) ("podcast_rag_dependency_check_{0}.py" -f [guid]::NewGuid().ToString("N"))
+    @"
 import importlib
 import importlib.metadata as metadata
 import sys
@@ -212,15 +213,19 @@ print("VERSIONS:" + "|".join(versions))
 if failures:
     print("FAILURES:" + "|".join(failures))
     sys.exit(1)
-"@
+"@ | Set-Content -LiteralPath $dependencyCheckPath -Encoding UTF8
 
-    $dependencyOutput = & conda run --no-capture-output -n $CondaEnvName python -c $dependencyCheck 2>&1
-    if ($LASTEXITCODE -eq 0) {
-        $versionsLine = ($dependencyOutput | Where-Object { $_ -like "VERSIONS:*" } | Select-Object -First 1)
-        $detail = if ($versionsLine) { $versionsLine.Substring("VERSIONS:".Length).Replace("|", ", ") } else { "Imports completed." }
-        Write-Check -Status PASS -Name "Python libraries" -Detail $detail
-    } else {
-        Write-Check -Status FAIL -Name "Python libraries" -Detail (($dependencyOutput | Out-String).Trim())
+    try {
+        $dependencyOutput = & conda run --no-capture-output -n $CondaEnvName python $dependencyCheckPath 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            $versionsLine = ($dependencyOutput | Where-Object { $_ -like "VERSIONS:*" } | Select-Object -First 1)
+            $detail = if ($versionsLine) { $versionsLine.Substring("VERSIONS:".Length).Replace("|", ", ") } else { "Imports completed." }
+            Write-Check -Status PASS -Name "Python libraries" -Detail $detail
+        } else {
+            Write-Check -Status FAIL -Name "Python libraries" -Detail (($dependencyOutput | Out-String).Trim())
+        }
+    } finally {
+        Remove-Item -LiteralPath $dependencyCheckPath -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -318,4 +323,3 @@ if ($script:Warned -gt 0) {
 
 Write-Host "Diagnostic passed with no warnings." -ForegroundColor Green
 exit 0
-
