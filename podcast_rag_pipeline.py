@@ -893,9 +893,31 @@ class PodcastRagPipeline:
     def sanitize_documents(self, docs: list[Document]) -> list[Document]:
         return [Document(page_content=doc.page_content, metadata=self.sanitize_metadata(doc.metadata)) for doc in docs]
 
+    def validate_documents_before_cache(self, docs: list[Document], label: str) -> None:
+        bad = []
+        for idx, doc in enumerate(docs):
+            node_id = doc.metadata.get("node_id", f"index_{idx}")
+            node_type = doc.metadata.get("node_type", "unknown")
+            if not has_substantive_text(doc.page_content, min_chars=1):
+                bad.append(f"{node_id} ({node_type}) has empty page_content")
+            elif node_type in {"cluster_summary", "episode_thesis", "position_card"} and is_missing_context_response(doc.page_content):
+                bad.append(f"{node_id} ({node_type}) has a missing-context response")
+
+        if bad:
+            preview = "; ".join(bad[:10])
+            if len(bad) > 10:
+                preview += f"; and {len(bad) - 10} more"
+            raise ValueError(f"{label} produced invalid documents: {preview}")
+
     def insert_documents(self, docs: list[Document]) -> None:
-        ids = [doc.metadata["node_id"] for doc in docs]
-        self.vectorstore.add_documents(self.sanitize_documents(docs), ids=ids)
+        valid_docs = [doc for doc in docs if has_substantive_text(doc.page_content, min_chars=1)]
+        skipped = len(docs) - len(valid_docs)
+        if skipped:
+            print(f"  Skipped {skipped} empty document(s) before vector DB insertion.")
+        if not valid_docs:
+            raise ValueError("No non-empty documents available for vector DB insertion.")
+        ids = [doc.metadata["node_id"] for doc in valid_docs]
+        self.vectorstore.add_documents(self.sanitize_documents(valid_docs), ids=ids)
 
     def load_cached_documents(self, cache_path: Path) -> list[Document]:
         payload = json.loads(cache_path.read_text(encoding="utf-8"))
@@ -913,6 +935,7 @@ class PodcastRagPipeline:
 
     def save_cached_documents(self, cache_path: Path, source_path: Path, fingerprint: str, docs: list[Document]) -> None:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
+        self.validate_documents_before_cache(docs, f"cache write {cache_path}")
         payload = {
             "version": 1,
             "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -936,6 +959,7 @@ class PodcastRagPipeline:
         docs = self.load_cached_documents(cache_path)
         if not docs:
             raise RuntimeError(f"Processed data cache was empty: {cache_path}")
+        self.validate_documents_before_cache(docs, f"cache {cache_path}")
         self.insert_documents(docs)
         print(f"  Inserted {len(docs)} cached documents into vector DB for {path}")
         return {
@@ -959,6 +983,7 @@ class PodcastRagPipeline:
         all_nodes, thesis_doc = self.build_hierarchy(leaf_chunks, source)
         position_docs = self.extract_positions(all_nodes, thesis_doc)
         all_nodes.extend(position_docs)
+        self.validate_documents_before_cache(all_nodes, source)
         elapsed = dt.timedelta(seconds=int(time.time() - start))
 
         print(
