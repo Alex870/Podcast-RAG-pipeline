@@ -77,6 +77,7 @@ class PipelineConfig:
     max_position_source_docs: int = 40
     embedding_batch_size: int = 64
     llm_max_tokens: int = 4096
+    max_reduction_rounds: int = 8
 
 
 class PipelineInterrupted(Exception):
@@ -336,6 +337,11 @@ def fallback_summary_from_text(text: str, label: str, max_chars: int = 1800) -> 
     )
 
 
+def text_fingerprint(values: list[str]) -> str:
+    payload = "\n\n".join(re.sub(r"\s+", " ", value or "").strip() for value in values)
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+
 def extract_llm_text(response: Any) -> str:
     if isinstance(response, str):
         return response
@@ -505,7 +511,7 @@ class PodcastRagPipeline:
                         "and the context needed to answer future questions accurately. Avoid filler. "
                         "Return a non-empty final answer in the assistant message content. Do not ask for more source text.",
                     ),
-                    ("user", "The source material to summarize is included below between delimiters.\n\n<<<SOURCE_MATERIAL>>>\n{text}\n<<<END_SOURCE_MATERIAL>>>\n\nSummarize only the provided source material for retrieval. Return the final summary now.\n/no_think"),
+                    ("user", f"The source material to summarize is included below between delimiters.\n\n<<<SOURCE_MATERIAL>>>\n{{text}}\n<<<END_SOURCE_MATERIAL>>>\n\nSummarize only the provided source material for retrieval. Return the final summary now.{self.thinking_control_suffix()}"),
                 ]
             )
         )
@@ -518,7 +524,7 @@ class PodcastRagPipeline:
                         "normative commitments, policy preferences, key uncertainties, and notable counterarguments. "
                         "Return a non-empty final answer in the assistant message content. Do not ask for more source text.",
                     ),
-                    ("user", "The episode source material is included below between delimiters.\n\n<<<SOURCE_MATERIAL>>>\n{text}\n<<<END_SOURCE_MATERIAL>>>\n\nCreate an episode thesis summary using only the provided source material. Return the final summary now.\n/no_think"),
+                    ("user", f"The episode source material is included below between delimiters.\n\n<<<SOURCE_MATERIAL>>>\n{{text}}\n<<<END_SOURCE_MATERIAL>>>\n\nCreate an episode thesis summary using only the provided source material. Return the final summary now.{self.thinking_control_suffix()}"),
                 ]
             )
         )
@@ -537,7 +543,7 @@ class PodcastRagPipeline:
                         'Return a JSON object with key "positions". Each position must be an object with keys: '
                         '"claim", "speaker", "stance_category", "confidence", "rationale", "counterpoints", '
                         '"evidence_node_ids", "evidence_timestamps", and "keywords".\n\n'
-                        "Use only evidence from the passages below.\n\n{text}\n/no_think",
+                        f"Use only evidence from the passages below.\n\n{{text}}{self.thinking_control_suffix()}",
                     ),
                 ]
             )
@@ -550,6 +556,12 @@ class PodcastRagPipeline:
 
     def make_chain(self, prompt):
         return prompt | self.llm
+
+    def thinking_control_suffix(self) -> str:
+        model_name = (self.config.lm_studio_model or "").lower()
+        if "qwen" in model_name:
+            return "\n/no_think"
+        return ""
 
     def write_llm_debug_event(
         self,
@@ -760,7 +772,11 @@ class PodcastRagPipeline:
         if not pending:
             raise ValueError(f"{label} had no substantive text blocks to summarize.")
 
-        while True:
+        original_text = "\n\n".join(pending)
+        seen_fingerprints = {text_fingerprint(pending)}
+        previous_total_chars = sum(len(block) for block in pending)
+
+        for reduction_round in range(1, max(1, self.config.max_reduction_rounds) + 1):
             joined = "\n\n".join(pending)
             if len(pending) == 1 and len(joined) <= self.config.rollup_char_budget:
                 return self.invoke_llm(chain, joined, label)
@@ -790,7 +806,40 @@ class PodcastRagPipeline:
 
             if len(reduced) == 1:
                 return reduced[0]
+
+            reduced_total_chars = sum(len(block) for block in reduced)
+            reduced_fingerprint = text_fingerprint(reduced)
+            made_progress = len(reduced) < len(pending) or reduced_total_chars < int(previous_total_chars * 0.9)
+            if reduced_fingerprint in seen_fingerprints or not made_progress:
+                debug_path = self.write_llm_debug_event(
+                    label=label,
+                    event="reduction_stalled",
+                    prompt_text=original_text,
+                    response_text="\n\n".join(reduced),
+                    error=(
+                        f"Reduction stalled on round {reduction_round}: "
+                        f"{len(pending)} block(s), {previous_total_chars} chars -> "
+                        f"{len(reduced)} block(s), {reduced_total_chars} chars."
+                    ),
+                )
+                print(f"  {label} reduction stalled; using deterministic fallback summary.")
+                print(f"  debug saved: {debug_path}")
+                return fallback_summary_from_text(original_text, label, max_chars=min(2400, self.config.rollup_char_budget))
+
+            seen_fingerprints.add(reduced_fingerprint)
+            previous_total_chars = reduced_total_chars
             pending = reduced
+
+        debug_path = self.write_llm_debug_event(
+            label=label,
+            event="reduction_round_limit",
+            prompt_text=original_text,
+            response_text="\n\n".join(pending),
+            error=f"Reduction exceeded max_reduction_rounds={self.config.max_reduction_rounds}.",
+        )
+        print(f"  {label} reached reduction round limit; using deterministic fallback summary.")
+        print(f"  debug saved: {debug_path}")
+        return fallback_summary_from_text(original_text, label, max_chars=min(2400, self.config.rollup_char_budget))
 
     def summarize_documents(self, docs: list[Document], chain, label: str) -> str:
         source_docs = [doc for doc in docs if has_substantive_text(doc.page_content, min_chars=20)]
