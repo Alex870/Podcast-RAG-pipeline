@@ -87,6 +87,10 @@ class MissingContextResponse(Exception):
     pass
 
 
+class EmptyLLMResponse(Exception):
+    pass
+
+
 class PerformanceTracker:
     def __init__(self, report_interval_seconds: int):
         self.report_interval_seconds = max(5, int(report_interval_seconds or 30))
@@ -313,7 +317,7 @@ def has_substantive_text(text: str, min_chars: int = 40) -> bool:
 def is_missing_context_response(text: str) -> bool:
     compact = re.sub(r"\s+", " ", text or "").strip().lower()
     if not compact:
-        return True
+        return False
     asks_for_missing_input = (
         ("please provide" in compact or "please share" in compact or "send me" in compact)
         and any(term in compact for term in ["transcript", "source text", "source material", "podcast text", "material"])
@@ -451,9 +455,10 @@ class PodcastRagPipeline:
                         "system",
                         "You create retrieval-oriented summaries for a long-form podcast knowledge base. "
                         "Emphasize durable beliefs, recurring arguments, values, causal explanations, disagreements, "
-                        "and the context needed to answer future questions accurately. Avoid filler.",
+                        "and the context needed to answer future questions accurately. Avoid filler. "
+                        "Return a non-empty final answer in the assistant message content. Do not ask for more source text.",
                     ),
-                    ("user", "The source material to summarize is included below between delimiters.\n\n<<<SOURCE_MATERIAL>>>\n{text}\n<<<END_SOURCE_MATERIAL>>>\n\nSummarize only the provided source material for retrieval."),
+                    ("user", "/no_think\nThe source material to summarize is included below between delimiters.\n\n<<<SOURCE_MATERIAL>>>\n{text}\n<<<END_SOURCE_MATERIAL>>>\n\nSummarize only the provided source material for retrieval. Return the final summary now."),
                 ]
             )
         )
@@ -463,9 +468,10 @@ class PodcastRagPipeline:
                     (
                         "system",
                         "You are distilling an episode-level worldview summary. Extract the central theses, recurring positions, "
-                        "normative commitments, policy preferences, key uncertainties, and notable counterarguments.",
+                        "normative commitments, policy preferences, key uncertainties, and notable counterarguments. "
+                        "Return a non-empty final answer in the assistant message content. Do not ask for more source text.",
                     ),
-                    ("user", "The episode source material is included below between delimiters.\n\n<<<SOURCE_MATERIAL>>>\n{text}\n<<<END_SOURCE_MATERIAL>>>\n\nCreate an episode thesis summary using only the provided source material."),
+                    ("user", "/no_think\nThe episode source material is included below between delimiters.\n\n<<<SOURCE_MATERIAL>>>\n{text}\n<<<END_SOURCE_MATERIAL>>>\n\nCreate an episode thesis summary using only the provided source material. Return the final summary now."),
                 ]
             )
         )
@@ -476,10 +482,12 @@ class PodcastRagPipeline:
                         "system",
                         "You extract durable positions from long-form podcasts. Return strict JSON only. "
                         "Focus on beliefs, philosophies, recurring preferences, normative claims, and causal models "
-                        "that would matter across episodes. Prefer precision over volume.",
+                        "that would matter across episodes. Prefer precision over volume. "
+                        "Return a non-empty final JSON object in the assistant message content. Do not ask for more source text.",
                     ),
                     (
                         "user",
+                        "/no_think\n"
                         'Return a JSON object with key "positions". Each position must be an object with keys: '
                         '"claim", "speaker", "stance_category", "confidence", "rationale", "counterpoints", '
                         '"evidence_node_ids", "evidence_timestamps", and "keywords".\n\n'
@@ -534,6 +542,16 @@ class PodcastRagPipeline:
         try:
             def run_and_validate():
                 candidate = chain.invoke({"text": text})
+                if not has_substantive_text(candidate, min_chars=1):
+                    debug_path = self.write_llm_debug_event(
+                        label=label,
+                        event="empty_response",
+                        prompt_text=text,
+                        response_text=candidate,
+                        error="Model returned empty assistant message content.",
+                    )
+                    print(f"  debug saved: {debug_path}")
+                    raise EmptyLLMResponse(f"{label} returned an empty response.")
                 if is_missing_context_response(candidate):
                     debug_path = self.write_llm_debug_event(
                         label=label,
@@ -547,6 +565,21 @@ class PodcastRagPipeline:
                 return candidate
 
             result = with_retry(run_and_validate, label)
+        except EmptyLLMResponse:
+            self.performance.record_failure()
+            if "position extraction" in label:
+                print(f"  {label} returned empty responses; using empty position list.")
+                return '{"positions": []}'
+            print(f"  {label} returned empty responses; using fallback extractive summary.")
+            result = fallback_summary_from_text(text, label)
+            debug_path = self.write_llm_debug_event(
+                label=label,
+                event="fallback_after_empty_response",
+                prompt_text=text,
+                response_text=result,
+                error="All retries returned empty assistant message content.",
+            )
+            print(f"  debug saved: {debug_path}")
         except MissingContextResponse:
             self.performance.record_failure()
             if "position extraction" in label:
