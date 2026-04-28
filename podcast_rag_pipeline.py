@@ -11,6 +11,7 @@ import shutil
 import signal
 import time
 import uuid
+from collections import deque
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, fields
 from pathlib import Path
@@ -101,11 +102,65 @@ class PerformanceTracker:
         self.failures = 0
         self.total_seconds = 0.0
         self.approx_output_tokens = 0
+        self.recent_results = deque(maxlen=50)
+        self.current_file = ""
+        self.current_file_started_at = self.started_at
+        self.current_file_max_total_tokens = 0
+        self.current_file_max_token_label = ""
+        self.run_max_total_tokens = 0
+        self.run_max_token_label = ""
+        self.run_max_token_file = ""
 
-    def record_llm_result(self, label: str, elapsed: float, text: str) -> None:
+    def start_file(self, label: str) -> None:
+        self.current_file = label
+        self.current_file_started_at = time.time()
+        self.current_file_max_total_tokens = 0
+        self.current_file_max_token_label = ""
+
+    def finish_file(self) -> None:
+        elapsed = dt.timedelta(seconds=int(time.time() - self.current_file_started_at))
+        print(
+            "  file telemetry: "
+            f"elapsed={elapsed}, "
+            f"file_max_total_tokens={self.current_file_max_total_tokens or 'unknown'}"
+            f"{self._format_token_label(self.current_file_max_token_label)}, "
+            f"run_max_total_tokens={self.run_max_total_tokens or 'unknown'}"
+            f"{self._format_token_label(self.run_max_token_label, self.run_max_token_file)}"
+        )
+
+    def _format_token_label(self, label: str, file_label: str = "") -> str:
+        if not label:
+            return ""
+        suffix = f" at {label}"
+        if file_label:
+            suffix += f" in {Path(file_label).name}"
+        return suffix
+
+    def record_token_usage(self, label: str, token_usage: dict[str, int] | None) -> None:
+        if not token_usage:
+            return
+        total_tokens = token_usage.get("total_tokens") or 0
+        if not total_tokens:
+            prompt_tokens = token_usage.get("prompt_tokens") or 0
+            completion_tokens = token_usage.get("completion_tokens") or 0
+            total_tokens = prompt_tokens + completion_tokens
+        if not total_tokens:
+            return
+        if total_tokens > self.current_file_max_total_tokens:
+            self.current_file_max_total_tokens = total_tokens
+            self.current_file_max_token_label = label
+        if total_tokens > self.run_max_total_tokens:
+            self.run_max_total_tokens = total_tokens
+            self.run_max_token_label = label
+            self.run_max_token_file = self.current_file
+
+    def record_llm_result(self, label: str, elapsed: float, text: str, token_usage: dict[str, int] | None = None) -> None:
         self.requests += 1
         self.total_seconds += elapsed
-        self.approx_output_tokens += max(1, len(text or "") // 4)
+        approx_tokens = max(1, len(text or "") // 4)
+        self.approx_output_tokens += approx_tokens
+        self.recent_results.append((time.time(), elapsed, approx_tokens))
+        self.record_token_usage(label, token_usage)
         self.maybe_report(label)
 
     def record_failure(self) -> None:
@@ -119,17 +174,39 @@ class PerformanceTracker:
 
         wall = max(0.001, now - self.started_at)
         model_seconds = max(0.001, self.total_seconds)
-        req_per_min = self.requests / wall * 60.0
+        req_per_min_all = self.requests / wall * 60.0
+        recent = [(ts, elapsed, tokens) for ts, elapsed, tokens in self.recent_results if now - ts <= 300]
+        if len(recent) >= 2:
+            recent_window = max(60.0, now - recent[0][0])
+            req_per_min_recent = len(recent) / recent_window * 60.0
+            recent_model_seconds = max(0.001, sum(item[1] for item in recent))
+            recent_tok_per_sec = sum(item[2] for item in recent) / recent_model_seconds
+        else:
+            req_per_min_recent = 0.0
+            recent_tok_per_sec = 0.0
         approx_tok_per_sec = self.approx_output_tokens / model_seconds
         print(
             "  perf: "
             f"requests={self.requests}, failures={self.failures}, "
             f"avg_request_seconds={self.total_seconds / max(1, self.requests):.1f}, "
-            f"requests_per_min={req_per_min:.2f}, "
-            f"approx_output_tokens_per_sec={approx_tok_per_sec:.1f}, "
+            f"requests_per_min_recent={req_per_min_recent:.2f}, "
+            f"requests_per_min_all={req_per_min_all:.2f}, "
+            f"approx_output_tokens_per_sec_recent={recent_tok_per_sec:.1f}, "
+            f"approx_output_tokens_per_sec_all={approx_tok_per_sec:.1f}, "
+            f"file_max_tokens={self.current_file_max_total_tokens or 'unknown'}, "
+            f"run_max_tokens={self.run_max_total_tokens or 'unknown'}, "
             f"last={label}"
         )
         self.last_report_at = now
+
+    def final_report(self) -> None:
+        elapsed = dt.timedelta(seconds=int(time.time() - self.started_at))
+        print(
+            "\nRun telemetry: "
+            f"elapsed={elapsed}, requests={self.requests}, failures={self.failures}, "
+            f"run_max_total_tokens={self.run_max_total_tokens or 'unknown'}"
+            f"{self._format_token_label(self.run_max_token_label, self.run_max_token_file)}"
+        )
 
 
 class RuntimeControl:
@@ -253,6 +330,18 @@ def format_seconds(seconds: float | None) -> str:
     minutes = (total % 3600) // 60
     secs = total % 60
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def format_duration(seconds: float | None) -> str:
+    if seconds is None:
+        return "unknown"
+    return str(dt.timedelta(seconds=int(max(0, seconds))))
+
+
+def estimate_remaining_seconds(completed: int, total: int, elapsed_seconds: float) -> float | None:
+    if completed <= 0 or total <= completed:
+        return None
+    return elapsed_seconds / completed * (total - completed)
 
 
 def parse_episode_date(value: Any) -> str | None:
@@ -510,6 +599,39 @@ def serialize_llm_response(response: Any) -> Any:
     return payload
 
 
+def extract_token_usage(response: Any) -> dict[str, int]:
+    candidates = []
+    usage_metadata = getattr(response, "usage_metadata", None)
+    if isinstance(usage_metadata, dict):
+        candidates.append(usage_metadata)
+    response_metadata = getattr(response, "response_metadata", {}) or {}
+    if isinstance(response_metadata, dict):
+        candidates.append(response_metadata.get("token_usage") or {})
+        candidates.append(response_metadata.get("usage") or {})
+        candidates.append(response_metadata)
+
+    usage: dict[str, int] = {}
+    aliases = {
+        "prompt_tokens": ("prompt_tokens", "input_tokens"),
+        "completion_tokens": ("completion_tokens", "output_tokens"),
+        "total_tokens": ("total_tokens",),
+    }
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        for target, keys in aliases.items():
+            if target in usage:
+                continue
+            for key in keys:
+                value = candidate.get(key)
+                if isinstance(value, int):
+                    usage[target] = value
+                    break
+    if "total_tokens" not in usage and ("prompt_tokens" in usage or "completion_tokens" in usage):
+        usage["total_tokens"] = usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
+    return usage
+
+
 def verify_model_available(config: PipelineConfig) -> None:
     client = OpenAI(base_url=config.lm_studio_base_url, api_key=config.lm_studio_api_key)
     models = [model.id for model in client.models.list().data]
@@ -745,9 +867,12 @@ class PodcastRagPipeline:
             raise ValueError(f"{label} received empty or too-short source text.")
 
         start = time.time()
+        token_usage: dict[str, int] = {}
         try:
             def run_and_validate():
+                nonlocal token_usage
                 raw_candidate = chain.invoke({"text": text})
+                token_usage = extract_token_usage(raw_candidate)
                 candidate = extract_llm_text(raw_candidate)
                 if not has_substantive_text(candidate, min_chars=1):
                     debug_path = self.write_llm_debug_event(
@@ -820,7 +945,7 @@ class PodcastRagPipeline:
             print(f"  {label} failed after retries; using fallback extractive summary. error={error_text}")
             result = fallback_summary_from_text(text, label)
 
-        self.performance.record_llm_result(label, time.time() - start, result)
+        self.performance.record_llm_result(label, time.time() - start, result, token_usage)
         return result
 
     def normalize_doc(self, doc: Document, source: str, index: int) -> Document:
@@ -1135,11 +1260,15 @@ class PodcastRagPipeline:
                     for future in done:
                         summaries.append(future.result())
                         completed += 1
-                        elapsed = dt.timedelta(seconds=int(time.time() - start_time))
+                        elapsed_seconds = time.time() - start_time
+                        elapsed = dt.timedelta(seconds=int(elapsed_seconds))
+                        eta = format_duration(estimate_remaining_seconds(completed, len(clusters), elapsed_seconds))
                         live_limit = self.control.max_parallel_model_requests()
                         print(
                             f"  [{completed:2d}/{len(clusters)}] built L{level} summary nodes "
-                            f"elapsed={elapsed} in_flight={len(running)} live_parallel={live_limit}"
+                            f"elapsed={elapsed} eta={eta} in_flight={len(running)} live_parallel={live_limit} "
+                            f"file_max_tokens={self.performance.current_file_max_total_tokens or 'unknown'} "
+                            f"run_max_tokens={self.performance.run_max_total_tokens or 'unknown'}"
                         )
                         self.performance.maybe_report(f"L{level} summary", force=False)
 
@@ -1428,11 +1557,13 @@ class PodcastRagPipeline:
     def process_file(self, path: Path) -> dict[str, Any]:
         source = str(path)
         print(f"\nProcessing: {source}")
+        self.performance.start_file(source)
         docs = load_transcript_json(path)
         leaf_chunks = self.build_leaf_chunks(docs, source)
 
         if not leaf_chunks:
             print("  No usable text found; skipping")
+            self.performance.finish_file()
             return {"status": "skipped", "nodes": 0}
 
         start = time.time()
@@ -1449,6 +1580,7 @@ class PodcastRagPipeline:
         )
 
         self.performance.maybe_report("file complete", force=True)
+        self.performance.finish_file()
         return {
             "status": "completed",
             "source": "llm_processing",
@@ -1542,6 +1674,8 @@ def run_batch(config: PipelineConfig, project_dir: Path, one_file: bool) -> int:
         print("All pending files have processed data caches; skipping LM Studio model verification.")
 
     pipeline = PodcastRagPipeline(config, project_dir, control)
+    batch_started_at = time.time()
+    completed_files_this_run = 0
 
     for idx, (path, fingerprint) in enumerate(pending, 1):
         if STOP_REQUESTED or stop_file.exists():
@@ -1549,7 +1683,8 @@ def run_batch(config: PipelineConfig, project_dir: Path, one_file: bool) -> int:
             break
 
         cache_path = processed_data_cache_path(processed_data_dir, fingerprint, path)
-        print(f"\nFile {idx}/{len(pending)}")
+        file_eta = format_duration(estimate_remaining_seconds(completed_files_this_run, len(pending), time.time() - batch_started_at))
+        print(f"\nFile {idx}/{len(pending)} eta_files={file_eta}")
 
         try:
             if cache_path.exists():
@@ -1592,6 +1727,8 @@ def run_batch(config: PipelineConfig, project_dir: Path, one_file: bool) -> int:
                 result["moved_to"] = moved_to
             mark_state(state, fingerprint, path, result["status"], result)
             save_state(state_path, state)
+            if result["status"] in {"completed", "skipped"}:
+                completed_files_this_run += 1
         except PipelineInterrupted as exc:
             mark_state(state, fingerprint, path, "interrupted", {"error": str(exc)})
             save_state(state_path, state)
@@ -1610,6 +1747,7 @@ def run_batch(config: PipelineConfig, project_dir: Path, one_file: bool) -> int:
             print("Stop request detected. Batch will resume with the next pending file on the next run.")
             break
 
+    pipeline.performance.final_report()
     print("\nBatch run complete.")
     return 0
 
