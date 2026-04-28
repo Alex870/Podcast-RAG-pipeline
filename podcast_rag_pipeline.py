@@ -918,10 +918,20 @@ class PodcastRagPipeline:
                 batches.append("\n\n".join(current_batch))
 
             reduced = []
+            if len(batches) > 1:
+                print(
+                    f"  {label} reduction round {reduction_round}: "
+                    f"{len(batches)} batch(es) from {len(pending)} block(s)"
+                )
             for idx, batch in enumerate(batches):
                 if STOP_REQUESTED:
                     raise PipelineInterrupted("Stop requested before starting another model request.")
                 reduced.append(self.invoke_llm(chain, batch, f"{label} batch {idx + 1}"))
+                if len(batches) > 1:
+                    print(
+                        f"  {label} reduction round {reduction_round}: "
+                        f"completed batch {idx + 1}/{len(batches)}"
+                    )
 
             if len(reduced) == 1:
                 return reduced[0]
