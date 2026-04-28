@@ -318,6 +318,32 @@ def extract_json_payload(text: str) -> Any:
     return {}
 
 
+def extract_position_objects_from_partial_json(text: str) -> list[dict[str, Any]]:
+    match = re.search(r'"positions"\s*:\s*\[', text or "")
+    if not match:
+        return []
+
+    decoder = json.JSONDecoder()
+    idx = match.end()
+    positions = []
+    while idx < len(text):
+        while idx < len(text) and text[idx] in " \r\n\t,":
+            idx += 1
+        if idx >= len(text) or text[idx] == "]":
+            break
+        if text[idx] != "{":
+            idx += 1
+            continue
+        try:
+            payload, end = decoder.raw_decode(text[idx:])
+        except json.JSONDecodeError:
+            break
+        if isinstance(payload, dict) and payload.get("claim"):
+            positions.append(payload)
+        idx += end
+    return positions
+
+
 def with_retry(func, label: str, retries: int = 3, delay: int = 1):
     for attempt in range(retries):
         if STOP_REQUESTED:
@@ -668,7 +694,7 @@ class PodcastRagPipeline:
                         'Return a JSON object with key "positions". Each position must be an object with keys: '
                         '"claim", "speaker", "episode_date", "stance_category", "confidence", "rationale", "counterpoints", '
                         '"evidence_node_ids", "evidence_timestamps", and "keywords".\n\n'
-                        f"Use only evidence from the passages below. Prefer speaker-specific position cards over generic episode-level claims. If attribution is ambiguous, skip the claim instead of guessing. Return JSON only, with no markdown, no commentary, and no bullet list outside the JSON object.\n\n{{text}}{self.thinking_control_suffix()}",
+                        f"Use only evidence from the passages below. Prefer speaker-specific position cards over generic episode-level claims. If attribution is ambiguous, skip the claim instead of guessing. Return at most 5 positions. Keep each field concise. Return JSON only, with no markdown, no commentary, and no bullet list outside the JSON object.\n\n{{text}}{self.thinking_control_suffix()}",
                     ),
                 ]
             )
@@ -954,7 +980,7 @@ class PodcastRagPipeline:
 
             reduced_total_chars = sum(len(block) for block in reduced)
             reduced_fingerprint = text_fingerprint(reduced)
-            made_progress = len(reduced) < len(pending) or reduced_total_chars < int(previous_total_chars * 0.9)
+            made_progress = len(reduced) < len(pending) or reduced_total_chars < previous_total_chars
             if reduced_fingerprint in seen_fingerprints or not made_progress:
                 debug_path = self.write_llm_debug_event(
                     label=label,
@@ -1222,6 +1248,10 @@ class PodcastRagPipeline:
             if not isinstance(positions, list) and payload.get("claim"):
                 positions = [payload]
         if not isinstance(positions, list):
+            partial_positions = extract_position_objects_from_partial_json(raw)
+            if partial_positions:
+                print(f"{label} returned truncated JSON; recovered {len(partial_positions)} complete position object(s)")
+                return partial_positions
             print(f"{label} returned non-list payload; skipping")
             debug_path = self.write_llm_debug_event(
                 label=label,
