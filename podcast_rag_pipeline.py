@@ -411,6 +411,27 @@ def compact_reduced_summaries(summaries: list[str], label: str, max_chars: int) 
     return f"Deterministic compacted summary for {label}: {clip_text(combined, max_chars)}"
 
 
+def coerce_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, list):
+        return "; ".join(coerce_text(item) for item in value if coerce_text(item)).strip()
+    if isinstance(value, dict):
+        return json.dumps(value, ensure_ascii=True)
+    return str(value).strip()
+
+
+def coerce_string_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [coerce_text(item) for item in value if coerce_text(item)]
+    text = coerce_text(value)
+    return [text] if text else []
+
+
 def text_fingerprint(values: list[str]) -> str:
     payload = "\n\n".join(re.sub(r"\s+", " ", value or "").strip() for value in values)
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()
@@ -639,6 +660,7 @@ class PodcastRagPipeline:
                         "Focus on beliefs, philosophies, recurring preferences, normative claims, and causal models "
                         "that would matter across episodes. Prefer precision over volume. "
                         "Only attribute a position to a speaker when the provided evidence supports that attribution. "
+                        "Every JSON field must use a string value except evidence_node_ids, evidence_timestamps, and keywords, which must be arrays of strings. "
                         "Return a non-empty final JSON object in the assistant message content. Do not ask for more source text.",
                     ),
                     (
@@ -646,7 +668,7 @@ class PodcastRagPipeline:
                         'Return a JSON object with key "positions". Each position must be an object with keys: '
                         '"claim", "speaker", "episode_date", "stance_category", "confidence", "rationale", "counterpoints", '
                         '"evidence_node_ids", "evidence_timestamps", and "keywords".\n\n'
-                        f"Use only evidence from the passages below. Prefer speaker-specific position cards over generic episode-level claims. If attribution is ambiguous, skip the claim instead of guessing.\n\n{{text}}{self.thinking_control_suffix()}",
+                        f"Use only evidence from the passages below. Prefer speaker-specific position cards over generic episode-level claims. If attribution is ambiguous, skip the claim instead of guessing. Return JSON only, with no markdown, no commentary, and no bullet list outside the JSON object.\n\n{{text}}{self.thinking_control_suffix()}",
                     ),
                 ]
             )
@@ -1192,8 +1214,23 @@ class PodcastRagPipeline:
     def parse_position_payload(self, raw: str, label: str) -> list[dict[str, Any]]:
         payload = extract_json_payload(raw)
         positions = payload.get("positions") if isinstance(payload, dict) else payload
+        if isinstance(payload, dict) and not isinstance(positions, list):
+            for key in ("claims", "position_cards", "items", "results"):
+                if isinstance(payload.get(key), list):
+                    positions = payload[key]
+                    break
+            if not isinstance(positions, list) and payload.get("claim"):
+                positions = [payload]
         if not isinstance(positions, list):
             print(f"{label} returned non-list payload; skipping")
+            debug_path = self.write_llm_debug_event(
+                label=label,
+                event="position_payload_not_list",
+                prompt_text="",
+                response_text=raw,
+                error=f"Could not parse a list of positions from model response. Parsed payload type={type(payload).__name__}.",
+            )
+            print(f"  debug saved: {debug_path}")
             return []
         return [position for position in positions if isinstance(position, dict) and position.get("claim")]
 
@@ -1217,20 +1254,27 @@ class PodcastRagPipeline:
         docs = []
         seen_position_keys = set()
         for idx, position in enumerate(positions):
-            evidence_ids = [item for item in position.get("evidence_node_ids", []) if isinstance(item, str)]
+            claim = coerce_text(position.get("claim"))
+            rationale = coerce_text(position.get("rationale"))
+            counterpoints = coerce_text(position.get("counterpoints"))
+            stance_category = coerce_text(position.get("stance_category")) or "unspecified"
+            confidence = coerce_text(position.get("confidence")) or "unknown"
+            evidence_ids = coerce_string_list(position.get("evidence_node_ids"))
             evidence_docs = [node_lookup[node_id] for node_id in evidence_ids if node_id in node_lookup]
-            evidence_times = [item for item in position.get("evidence_timestamps", []) if isinstance(item, str)]
-            keywords = [item for item in position.get("keywords", []) if isinstance(item, str)]
+            evidence_times = coerce_string_list(position.get("evidence_timestamps"))
+            keywords = coerce_string_list(position.get("keywords"))
             evidence_start = min((doc.metadata.get("start_time") for doc in evidence_docs if doc.metadata.get("start_time") is not None), default=thesis_meta.get("start_time"))
             evidence_end = max((doc.metadata.get("end_time") for doc in evidence_docs if doc.metadata.get("end_time") is not None), default=thesis_meta.get("end_time"))
             episode_date = parse_episode_date(position.get("episode_date")) or thesis_meta.get("episode_date")
-            position_speaker = str(position.get("speaker", "unknown")).strip() or "unknown"
+            position_speaker = coerce_text(position.get("speaker")) or "unknown"
             if position_speaker.lower() in {"unknown", "unclear", "ambiguous", "multiple", "mixed"}:
+                continue
+            if not claim:
                 continue
             position_key = (
                 position_speaker.lower(),
                 (episode_date or "").lower(),
-                re.sub(r"\s+", " ", position.get("claim", "").strip().lower()),
+                re.sub(r"\s+", " ", claim.lower()),
             )
             if position_key in seen_position_keys:
                 continue
@@ -1238,14 +1282,14 @@ class PodcastRagPipeline:
 
             card_text = "\n".join(
                 [
-                    f"Claim: {position.get('claim', '').strip()}",
+                    f"Claim: {claim}",
                     f"Speaker: {position_speaker}",
                     f"Episode Date: {episode_date or 'unknown'}",
                     f"Evidence Time: {format_seconds(evidence_start)}-{format_seconds(evidence_end)}",
-                    f"Category: {position.get('stance_category', 'unspecified')}",
-                    f"Confidence: {position.get('confidence', 'unknown')}",
-                    f"Rationale: {position.get('rationale', '').strip()}",
-                    f"Counterpoints: {position.get('counterpoints', '').strip()}",
+                    f"Category: {stance_category}",
+                    f"Confidence: {confidence}",
+                    f"Rationale: {rationale}",
+                    f"Counterpoints: {counterpoints}",
                     f"Keywords: {', '.join(keywords)}",
                 ]
             ).strip()
@@ -1267,11 +1311,11 @@ class PodcastRagPipeline:
                         "episode_sort_key": episode_sort_key(episode_date) or thesis_meta.get("episode_sort_key"),
                         "source_type": thesis_meta["source_type"],
                         "position_index": idx,
-                        "claim": position.get("claim", "").strip(),
+                        "claim": claim,
                         "speaker": position_speaker,
                         "speaker_scope": "single" if position_speaker != "unknown" else "unknown",
-                        "stance_category": position.get("stance_category", "unspecified"),
-                        "confidence": position.get("confidence", "unknown"),
+                        "stance_category": stance_category,
+                        "confidence": confidence,
                         "evidence_timestamps": evidence_times,
                         "keywords": keywords,
                         "start_time": evidence_start,
