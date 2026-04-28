@@ -66,9 +66,7 @@ import importlib
 import sys
 
 required = [
-    'chromadb',
     'hdbscan',
-    'langchain_chroma',
     'langchain_community',
     'langchain_huggingface',
     'langchain_openai',

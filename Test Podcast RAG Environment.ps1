@@ -181,10 +181,8 @@ import importlib.metadata as metadata
 import sys
 
 modules = [
-    ("chromadb", "chromadb"),
     ("hdbscan", "hdbscan"),
     ("langchain", "langchain"),
-    ("langchain_chroma", "langchain-chroma"),
     ("langchain_community", "langchain-community"),
     ("langchain_core", "langchain-core"),
     ("langchain_huggingface", "langchain-huggingface"),
@@ -236,7 +234,6 @@ if ($configObject) {
     $processedDataDir = Resolve-ProjectPath ([string]$configObject.processed_data_dir)
     $debugOutputDir = Resolve-ProjectPath ([string]$configObject.debug_output_dir)
     $statePath = Resolve-ProjectPath ([string]$configObject.state_path)
-    $persistDir = Resolve-ProjectPath ([string]$configObject.persist_dir)
     $stopFile = Resolve-ProjectPath ([string]$configObject.stop_file)
     $controlFile = Resolve-ProjectPath ([string]$configObject.control_file)
 
@@ -269,10 +266,6 @@ if ($configObject) {
 
     if ($statePath) {
         Test-WritableDirectory -Name "State directory" -Path (Split-Path -Parent $statePath)
-    }
-
-    if ($persistDir) {
-        Test-WritableDirectory -Name "Chroma persist directory" -Path $persistDir
     }
 
     if ($stopFile -and (Test-Path -LiteralPath $stopFile)) {

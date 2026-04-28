@@ -23,7 +23,7 @@ RUNTIME_DEPS_LOADED = False
 
 def load_runtime_deps() -> None:
     global RUNTIME_DEPS_LOADED
-    global hdbscan, np, PCA, Chroma, Document, StrOutputParser, ChatPromptTemplate
+    global hdbscan, np, PCA, Document, StrOutputParser, ChatPromptTemplate
     global HuggingFaceEmbeddings, ChatOpenAI, RecursiveCharacterTextSplitter, OpenAI, normalize
 
     if RUNTIME_DEPS_LOADED:
@@ -31,7 +31,6 @@ def load_runtime_deps() -> None:
 
     import hdbscan
     import numpy as np
-    from langchain_chroma import Chroma
     from langchain_core.documents import Document
     from langchain_core.output_parsers import StrOutputParser
     from langchain_core.prompts import ChatPromptTemplate
@@ -56,8 +55,6 @@ class PipelineConfig:
     processed_data_dir: str = "processed_data"
     debug_output_dir: str = "debug_output"
     move_processed_files: bool = False
-    persist_dir: str = "chroma_db_raptor_v2"
-    collection_name: str = "whisper_rag_v2"
     embedding_model: str = "BAAI/bge-large-en-v1.5"
     lm_studio_base_url: str = "http://127.0.0.1:1234/v1"
     lm_studio_api_key: str = "lm-studio"
@@ -653,11 +650,6 @@ class PodcastRagPipeline:
                     ),
                 ]
             )
-        )
-        self.vectorstore = Chroma(
-            embedding_function=self.embeddings,
-            persist_directory=str(resolve_path(project_dir, config.persist_dir)),
-            collection_name=config.collection_name,
         )
 
     def make_chain(self, prompt):
@@ -1290,20 +1282,6 @@ class PodcastRagPipeline:
             )
         return docs
 
-    def sanitize_metadata(self, metadata: dict[str, Any]) -> dict[str, Any]:
-        clean = {}
-        for key, value in metadata.items():
-            if value is None:
-                clean[key] = ""
-            elif isinstance(value, (str, int, float, bool)):
-                clean[key] = value
-            else:
-                clean[key] = json.dumps(value, ensure_ascii=True)
-        return clean
-
-    def sanitize_documents(self, docs: list[Document]) -> list[Document]:
-        return [Document(page_content=doc.page_content, metadata=self.sanitize_metadata(doc.metadata)) for doc in docs]
-
     def validate_documents_before_cache(self, docs: list[Document], label: str) -> None:
         bad = []
         for idx, doc in enumerate(docs):
@@ -1323,16 +1301,6 @@ class PodcastRagPipeline:
             if len(bad) > 10:
                 preview += f"; and {len(bad) - 10} more"
             raise ValueError(f"{label} produced invalid documents: {preview}")
-
-    def insert_documents(self, docs: list[Document]) -> None:
-        valid_docs = [doc for doc in docs if has_substantive_text(doc.page_content, min_chars=1)]
-        skipped = len(docs) - len(valid_docs)
-        if skipped:
-            print(f"  Skipped {skipped} empty document(s) before vector DB insertion.")
-        if not valid_docs:
-            raise ValueError("No non-empty documents available for vector DB insertion.")
-        ids = [doc.metadata["node_id"] for doc in valid_docs]
-        self.vectorstore.add_documents(self.sanitize_documents(valid_docs), ids=ids)
 
     def load_cached_documents(self, cache_path: Path) -> list[Document]:
         payload = json.loads(cache_path.read_text(encoding="utf-8"))
@@ -1369,14 +1337,13 @@ class PodcastRagPipeline:
         temp_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
         temp_path.replace(cache_path)
 
-    def insert_cached_file(self, path: Path, fingerprint: str, cache_path: Path) -> dict[str, Any]:
-        print(f"\nLoading cached processed data: {cache_path}")
+    def validate_cached_file(self, path: Path, fingerprint: str, cache_path: Path) -> dict[str, Any]:
+        print(f"\nValidating cached processed data: {cache_path}")
         docs = self.load_cached_documents(cache_path)
         if not docs:
             raise RuntimeError(f"Processed data cache was empty: {cache_path}")
         self.validate_documents_before_cache(docs, f"cache {cache_path}")
-        self.insert_documents(docs)
-        print(f"  Inserted {len(docs)} cached documents into vector DB for {path}")
+        print(f"  Cached processed data is valid for {path}: {len(docs)} documents")
         return {
             "status": "completed",
             "source": "processed_data_cache",
@@ -1490,10 +1457,7 @@ def run_batch(config: PipelineConfig, project_dir: Path, one_file: bool) -> int:
     if not pending:
         return 0
 
-    cached_pending = [
-        processed_data_cache_path(processed_data_dir, fingerprint, path).exists()
-        for path, fingerprint in pending
-    ]
+    cached_pending = [processed_data_cache_path(processed_data_dir, fingerprint, path).exists() for path, fingerprint in pending]
     needs_llm_processing = not all(cached_pending)
     if needs_llm_processing:
         if config.verify_model:
@@ -1516,7 +1480,7 @@ def run_batch(config: PipelineConfig, project_dir: Path, one_file: bool) -> int:
         try:
             if cache_path.exists():
                 try:
-                    result = pipeline.insert_cached_file(path, fingerprint, cache_path)
+                    result = pipeline.validate_cached_file(path, fingerprint, cache_path)
                 except ValueError as exc:
                     quarantined_path = quarantine_invalid_cache(cache_path, str(exc))
                     print(f"  Invalid processed data cache moved to: {quarantined_path}")
@@ -1533,7 +1497,6 @@ def run_batch(config: PipelineConfig, project_dir: Path, one_file: bool) -> int:
                     result["cache_path"] = str(cache_path)
                     result["quarantined_cache_path"] = str(quarantined_path)
                     print(f"  Saved processed data cache: {cache_path}")
-                    pipeline.insert_documents(docs)
             else:
                 mark_state(state, fingerprint, path, "in_progress")
                 save_state(state_path, state)
@@ -1546,7 +1509,6 @@ def run_batch(config: PipelineConfig, project_dir: Path, one_file: bool) -> int:
                 pipeline.save_cached_documents(cache_path, path, fingerprint, docs)
                 result["cache_path"] = str(cache_path)
                 print(f"  Saved processed data cache: {cache_path}")
-                pipeline.insert_documents(docs)
 
             moved_to = None
             if result["status"] == "completed" and config.move_processed_files:

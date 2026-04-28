@@ -1,8 +1,8 @@
 # Podcast RAG Pipeline
 
-This project builds a retrieval-oriented podcast knowledge base from JSON transcript files produced by `podcast_transcribe_host.py`. It creates leaf chunks, RAPTOR-style rollup summaries, episode thesis summaries, and durable position cards, then stores them in a persistent Chroma collection.
+This project builds pre-processed podcast RAG documents from JSON transcript files produced by `podcast_transcribe_host.py`. It creates leaf chunks, RAPTOR-style rollup summaries, episode thesis summaries, and durable position cards, then saves them as processed JSON caches.
 
-Before documents are inserted into Chroma, the LLM-produced processed documents are saved under `processed_data`. If you wipe the Chroma database later, rerunning the pipeline can load those cached documents and reinsert them without repeating the expensive LLM summarization work.
+Vector database insertion now lives in the separate `Chroma DB Import` project. This keeps expensive LLM preprocessing separate from Chroma database rebuilds.
 
 The default workflow targets a local LM Studio server on Windows 11 using LM Studio's OpenAI-compatible API. The included example config defaults to `http://127.0.0.1:1234/v1` with `unsloth/qwen3.6-35b-a3b`, but both values are configurable.
 
@@ -12,7 +12,7 @@ For overnight batch processing, local LM Studio processing is the sensible defau
 
 ## Repository Contents
 
-- `podcast_rag_pipeline.py`: main restartable Python pipeline
+- `podcast_rag_pipeline.py`: main restartable preprocessing pipeline
 - `Run Podcast RAG Pipeline.ps1`: Windows PowerShell launcher
 - `Test Podcast RAG Environment.ps1`: dependency and runtime diagnostic script
 - `Test Processed Data Cache.ps1`: scans cached processed documents for invalid missing-context LLM responses
@@ -100,7 +100,9 @@ The stop file is intentionally left in place so the request is visible. Remove i
 
 Progress is tracked in `state/podcast_rag_state.json`. Completed files are skipped on later runs using a stable fingerprint derived from file path, size, and modification time. If a file changes, it is treated as new work.
 
-Processed document caches are stored in `processed_data` using the same file fingerprint. When a matching cache exists, the pipeline skips LLM processing for that transcript and inserts the cached documents into Chroma instead. If every pending file has a cache, LM Studio model verification is skipped because no model generation is needed.
+Processed document caches are stored in `processed_data` using the same file fingerprint. When a matching cache exists, the pipeline validates it and skips LLM processing for that transcript. If every pending file has a cache, LM Studio model verification is skipped because no model generation is needed.
+
+To insert or reinsert processed caches into Chroma, use the separate `Chroma DB Import` project.
 
 To scan existing caches for missing-context LLM responses:
 
