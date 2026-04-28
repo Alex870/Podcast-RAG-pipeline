@@ -256,6 +256,35 @@ def format_seconds(seconds: float | None) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 
+def parse_episode_date(value: Any) -> str | None:
+    if value in (None, ""):
+        return None
+    text = str(value).strip()
+    if re.fullmatch(r"\d{8}", text):
+        return f"{text[:4]}-{text[4:6]}-{text[6:8]}"
+    match = re.search(r"(20\d{2})[-_/]?(\d{2})[-_/]?(\d{2})", text)
+    if match:
+        return f"{match.group(1)}-{match.group(2)}-{match.group(3)}"
+    return text
+
+
+def compact_episode_date(value: Any) -> str | None:
+    episode_date = parse_episode_date(value)
+    if not episode_date:
+        return None
+    match = re.search(r"(20\d{2})-(\d{2})-(\d{2})", episode_date)
+    if not match:
+        return None
+    return "".join(match.groups())
+
+
+def episode_sort_key(value: Any) -> int | None:
+    compact = compact_episode_date(value)
+    if not compact:
+        return None
+    return int(compact)
+
+
 def short_text(text: str, max_chars: int = 280) -> str:
     compact = re.sub(r"\s+", " ", text).strip()
     if len(compact) <= max_chars:
@@ -309,6 +338,33 @@ def episode_title_from_source(source: str) -> str:
 
 def merge_speaker_values(values) -> list[str]:
     return [value for value in dict.fromkeys(v for v in values if v)]
+
+
+def primary_speaker_from_record(record: dict[str, Any]) -> str | None:
+    words = record.get("words")
+    if isinstance(words, list):
+        counts: dict[str, int] = {}
+        for word in words:
+            if not isinstance(word, dict):
+                continue
+            speaker = word.get("speaker")
+            if not speaker:
+                continue
+            counts[str(speaker)] = counts.get(str(speaker), 0) + 1
+        if counts:
+            named_counts = {speaker: count for speaker, count in counts.items() if not re.fullmatch(r"SPEAKER_\d+", speaker)}
+            selected = named_counts or counts
+            return max(selected.items(), key=lambda item: item[1])[0]
+    speaker = first_present(record, ["speaker", "speaker_name", "speaker_id", "voice", "who"])
+    return str(speaker) if speaker else None
+
+
+def speaker_scope(speakers: list[str]) -> tuple[str, str]:
+    if len(speakers) == 1:
+        return speakers[0], "single"
+    if len(speakers) > 1:
+        return "", "multi"
+    return "", "unknown"
 
 
 def has_substantive_text(text: str, min_chars: int = 40) -> bool:
@@ -450,9 +506,29 @@ def extract_segment_records(payload: Any) -> list[dict[str, Any]]:
     return []
 
 
+def extract_episode_metadata(payload: Any, path: Path) -> dict[str, Any]:
+    source: dict[str, Any] = payload if isinstance(payload, dict) else {}
+    nested = source.get("metadata") if isinstance(source.get("metadata"), dict) else {}
+    episode_date = (
+        parse_episode_date(first_present(source, ["episode_date", "show_date", "recording_date", "published_date", "date"]))
+        or parse_episode_date(first_present(nested, ["episode_date", "show_date", "recording_date", "published_date", "date"]))
+        or parse_episode_date(path.name)
+    )
+    return {
+        "episode_date": episode_date,
+        "episode_date_compact": first_present(source, ["episode_date_compact"])
+        or first_present(nested, ["episode_date_compact"])
+        or compact_episode_date(episode_date),
+        "episode_sort_key": first_present(source, ["episode_sort_key"])
+        or first_present(nested, ["episode_sort_key"])
+        or episode_sort_key(episode_date),
+    }
+
+
 def load_transcript_json(path: Path) -> list[Document]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     records = extract_segment_records(payload)
+    episode_metadata = extract_episode_metadata(payload, path)
     docs = []
 
     for idx, record in enumerate(records):
@@ -460,14 +536,19 @@ def load_transcript_json(path: Path) -> list[Document]:
         if not text or not str(text).strip():
             continue
 
+        record_episode_date = parse_episode_date(first_present(record, ["episode_date", "show_date", "recording_date", "published_date", "date"]))
+        speaker = primary_speaker_from_record(record)
         metadata = {
             "source": str(path),
             "level": "leaf",
             "start_time": safe_float(first_present(record, ["start", "start_time", "timestamp_start"])),
             "end_time": safe_float(first_present(record, ["end", "end_time", "timestamp_end"])),
-            "speaker": first_present(record, ["speaker", "speaker_name", "speaker_id", "voice", "who"]),
+            "speaker": speaker,
             "segment_index": first_present(record, ["id", "segment_id", "seek"]) or idx,
             "source_type": "json_transcript",
+            "episode_date": record_episode_date or episode_metadata["episode_date"],
+            "episode_date_compact": first_present(record, ["episode_date_compact"]) or episode_metadata["episode_date_compact"],
+            "episode_sort_key": first_present(record, ["episode_sort_key"]) or episode_metadata["episode_sort_key"],
         }
         docs.append(Document(page_content=str(text).strip(), metadata=metadata))
 
@@ -487,6 +568,9 @@ def load_transcript_json(path: Path) -> list[Document]:
                     "speaker": None,
                     "segment_index": 0,
                     "source_type": "json_transcript",
+                    "episode_date": episode_metadata["episode_date"],
+                    "episode_date_compact": episode_metadata["episode_date_compact"],
+                    "episode_sort_key": episode_metadata["episode_sort_key"],
                 },
             )
         ]
@@ -527,10 +611,10 @@ class PodcastRagPipeline:
                         "system",
                         "You create retrieval-oriented summaries for a long-form podcast knowledge base. "
                         "Emphasize durable beliefs, recurring arguments, values, causal explanations, disagreements, "
-                        "and the context needed to answer future questions accurately. Avoid filler. "
+                        "speaker attribution, episode date, and the context needed to answer future questions accurately. Avoid filler. "
                         "Return a non-empty final answer in the assistant message content. Do not ask for more source text.",
                     ),
-                    ("user", f"The source material to summarize is included below between delimiters.\n\n<<<SOURCE_MATERIAL>>>\n{{text}}\n<<<END_SOURCE_MATERIAL>>>\n\nSummarize only the provided source material for retrieval. Return 5-10 dense bullets, no preamble, no repeated headings, and stay under {self.config.summary_target_chars} characters. Return the final summary now.{self.thinking_control_suffix()}"),
+                    ("user", f"The source material to summarize is included below between delimiters.\n\n<<<SOURCE_MATERIAL>>>\n{{text}}\n<<<END_SOURCE_MATERIAL>>>\n\nSummarize only the provided source material for retrieval. Preserve who said what when speaker labels are present. Include the episode date when available. Return 5-10 dense bullets, no preamble, no repeated headings, and stay under {self.config.summary_target_chars} characters. Return the final summary now.{self.thinking_control_suffix()}"),
                 ]
             )
         )
@@ -540,10 +624,10 @@ class PodcastRagPipeline:
                     (
                         "system",
                         "You are distilling an episode-level worldview summary. Extract the central theses, recurring positions, "
-                        "normative commitments, policy preferences, key uncertainties, and notable counterarguments. "
+                        "normative commitments, policy preferences, key uncertainties, notable counterarguments, and speaker attribution. "
                         "Return a non-empty final answer in the assistant message content. Do not ask for more source text.",
                     ),
-                    ("user", f"The episode source material is included below between delimiters.\n\n<<<SOURCE_MATERIAL>>>\n{{text}}\n<<<END_SOURCE_MATERIAL>>>\n\nCreate an episode thesis summary using only the provided source material. Return dense bullets, no preamble, no repeated headings, and stay under {self.config.summary_target_chars * 2} characters. Return the final summary now.{self.thinking_control_suffix()}"),
+                    ("user", f"The episode source material is included below between delimiters.\n\n<<<SOURCE_MATERIAL>>>\n{{text}}\n<<<END_SOURCE_MATERIAL>>>\n\nCreate an episode thesis summary using only the provided source material. Preserve which speaker held each position when the evidence supports attribution, and include the episode date when available. Return dense bullets, no preamble, no repeated headings, and stay under {self.config.summary_target_chars * 2} characters. Return the final summary now.{self.thinking_control_suffix()}"),
                 ]
             )
         )
@@ -555,14 +639,15 @@ class PodcastRagPipeline:
                         "You extract durable positions from long-form podcasts. Return strict JSON only. "
                         "Focus on beliefs, philosophies, recurring preferences, normative claims, and causal models "
                         "that would matter across episodes. Prefer precision over volume. "
+                        "Only attribute a position to a speaker when the provided evidence supports that attribution. "
                         "Return a non-empty final JSON object in the assistant message content. Do not ask for more source text.",
                     ),
                     (
                         "user",
                         'Return a JSON object with key "positions". Each position must be an object with keys: '
-                        '"claim", "speaker", "stance_category", "confidence", "rationale", "counterpoints", '
+                        '"claim", "speaker", "episode_date", "stance_category", "confidence", "rationale", "counterpoints", '
                         '"evidence_node_ids", "evidence_timestamps", and "keywords".\n\n'
-                        f"Use only evidence from the passages below.\n\n{{text}}{self.thinking_control_suffix()}",
+                        f"Use only evidence from the passages below. Prefer speaker-specific position cards over generic episode-level claims. If attribution is ambiguous, skip the claim instead of guessing.\n\n{{text}}{self.thinking_control_suffix()}",
                     ),
                 ]
             )
@@ -706,6 +791,9 @@ class PodcastRagPipeline:
         metadata["start_time"] = safe_float(metadata.get("start_time"))
         metadata["end_time"] = safe_float(metadata.get("end_time"))
         metadata["speaker"] = metadata.get("speaker")
+        metadata["episode_date"] = parse_episode_date(metadata.get("episode_date"))
+        metadata["episode_date_compact"] = metadata.get("episode_date_compact") or compact_episode_date(metadata.get("episode_date"))
+        metadata["episode_sort_key"] = metadata.get("episode_sort_key") or episode_sort_key(metadata.get("episode_date"))
         return Document(page_content=doc.page_content.strip(), metadata=metadata)
 
     def build_leaf_chunks(self, docs: list[Document], source: str) -> list[Document]:
@@ -748,7 +836,13 @@ class PodcastRagPipeline:
         start_time = min((doc.metadata.get("start_time") for doc in docs if doc.metadata.get("start_time") is not None), default=None)
         end_time = max((doc.metadata.get("end_time") for doc in docs if doc.metadata.get("end_time") is not None), default=None)
         speakers = merge_speaker_values(doc.metadata.get("speaker") for doc in docs)
-        text = "\n".join(doc.page_content for doc in docs if doc.page_content)
+        speaker, scope = speaker_scope(speakers)
+        first = docs[0].metadata
+        text = "\n".join(
+            f"[{doc.metadata.get('speaker') or 'unknown'} {format_seconds(doc.metadata.get('start_time'))}-{format_seconds(doc.metadata.get('end_time'))}] {doc.page_content}"
+            for doc in docs
+            if doc.page_content
+        )
         return Document(
             page_content=text,
             metadata={
@@ -760,11 +854,16 @@ class PodcastRagPipeline:
                 "source": source,
                 "episode_id": episode_id,
                 "episode_title": episode_title,
+                "episode_date": first.get("episode_date"),
+                "episode_date_compact": first.get("episode_date_compact"),
+                "episode_sort_key": first.get("episode_sort_key"),
                 "source_type": "json_transcript",
                 "segment_count": len(docs),
                 "segment_indices": [doc.metadata.get("segment_index") for doc in docs],
                 "start_time": start_time,
                 "end_time": end_time,
+                "speaker": speaker,
+                "speaker_scope": scope,
                 "speakers": speakers,
             },
         )
@@ -775,7 +874,8 @@ class PodcastRagPipeline:
         speakers = ", ".join(metadata.get("speakers") or ([metadata["speaker"]] if metadata.get("speaker") else [])) or "unknown"
         return (
             f"[node_id={metadata.get('node_id')} | type={metadata.get('node_type')} | level={metadata.get('level')} "
-            f"| speaker={speakers} | time={time_span}]\n{doc.page_content}"
+            f"| episode_date={metadata.get('episode_date') or 'unknown'} | speaker_scope={metadata.get('speaker_scope') or 'unknown'} "
+            f"| speakers={speakers} | time={time_span}]\n{doc.page_content}"
         )
 
     def reduce_text_blocks(self, blocks: list[str], chain, label: str) -> str:
@@ -921,6 +1021,7 @@ class PodcastRagPipeline:
             for doc in docs
             for speaker in (doc.metadata.get("speakers") or ([doc.metadata["speaker"]] if doc.metadata.get("speaker") else []))
         )
+        speaker, scope = speaker_scope(speakers)
 
         summary_doc = Document(
             page_content=summary,
@@ -933,9 +1034,14 @@ class PodcastRagPipeline:
                 "source": source,
                 "episode_id": first["episode_id"],
                 "episode_title": first["episode_title"],
+                "episode_date": first.get("episode_date"),
+                "episode_date_compact": first.get("episode_date_compact"),
+                "episode_sort_key": first.get("episode_sort_key"),
                 "source_type": first["source_type"],
                 "start_time": start_time,
                 "end_time": end_time,
+                "speaker": speaker,
+                "speaker_scope": scope,
                 "speakers": speakers,
             },
         )
@@ -994,6 +1100,12 @@ class PodcastRagPipeline:
 
         thesis_inputs = latest_summaries or leaf_chunks
         thesis_text = self.summarize_documents(thesis_inputs, self.thesis_chain, "episode thesis")
+        thesis_speakers = merge_speaker_values(
+            speaker
+            for doc in leaf_chunks
+            for speaker in (doc.metadata.get("speakers") or ([doc.metadata["speaker"]] if doc.metadata.get("speaker") else []))
+        )
+        thesis_speaker, thesis_scope = speaker_scope(thesis_speakers)
         thesis_doc = Document(
             page_content=thesis_text,
             metadata={
@@ -1005,14 +1117,15 @@ class PodcastRagPipeline:
                 "source": source,
                 "episode_id": leaf_chunks[0].metadata["episode_id"],
                 "episode_title": leaf_chunks[0].metadata["episode_title"],
+                "episode_date": leaf_chunks[0].metadata.get("episode_date"),
+                "episode_date_compact": leaf_chunks[0].metadata.get("episode_date_compact"),
+                "episode_sort_key": leaf_chunks[0].metadata.get("episode_sort_key"),
                 "source_type": leaf_chunks[0].metadata["source_type"],
                 "start_time": min((doc.metadata.get("start_time") for doc in leaf_chunks if doc.metadata.get("start_time") is not None), default=None),
                 "end_time": max((doc.metadata.get("end_time") for doc in leaf_chunks if doc.metadata.get("end_time") is not None), default=None),
-                "speakers": merge_speaker_values(
-                    speaker
-                    for doc in leaf_chunks
-                    for speaker in (doc.metadata.get("speakers") or ([doc.metadata["speaker"]] if doc.metadata.get("speaker") else []))
-                ),
+                "speaker": thesis_speaker,
+                "speaker_scope": thesis_scope,
+                "speakers": thesis_speakers,
             },
         )
 
@@ -1042,7 +1155,10 @@ class PodcastRagPipeline:
         payload = {
             "node_id": metadata["node_id"],
             "node_type": metadata["node_type"],
+            "episode_date": metadata.get("episode_date") or "",
             "time_range": f"{format_seconds(metadata.get('start_time'))}-{format_seconds(metadata.get('end_time'))}",
+            "speaker_scope": metadata.get("speaker_scope") or "unknown",
+            "speaker": metadata.get("speaker") or "",
             "speakers": metadata.get("speakers") or [],
             "text": short_text(doc.page_content, max_chars=1200),
         }
@@ -1051,6 +1167,7 @@ class PodcastRagPipeline:
     def extract_positions(self, all_nodes: list[Document], thesis_doc: Document) -> list[Document]:
         source_docs = self.build_position_source_docs(all_nodes, thesis_doc)
         prompt_text = "\n".join(self.render_position_passage(doc) for doc in source_docs)
+        node_lookup = {doc.metadata.get("node_id"): doc for doc in all_nodes if doc.metadata.get("node_id")}
 
         raw = self.invoke_llm(self.position_chain, prompt_text, "position extraction")
         payload = extract_json_payload(raw)
@@ -1066,13 +1183,22 @@ class PodcastRagPipeline:
                 continue
 
             evidence_ids = [item for item in position.get("evidence_node_ids", []) if isinstance(item, str)]
+            evidence_docs = [node_lookup[node_id] for node_id in evidence_ids if node_id in node_lookup]
             evidence_times = [item for item in position.get("evidence_timestamps", []) if isinstance(item, str)]
             keywords = [item for item in position.get("keywords", []) if isinstance(item, str)]
+            evidence_start = min((doc.metadata.get("start_time") for doc in evidence_docs if doc.metadata.get("start_time") is not None), default=thesis_meta.get("start_time"))
+            evidence_end = max((doc.metadata.get("end_time") for doc in evidence_docs if doc.metadata.get("end_time") is not None), default=thesis_meta.get("end_time"))
+            episode_date = parse_episode_date(position.get("episode_date")) or thesis_meta.get("episode_date")
+            position_speaker = str(position.get("speaker", "unknown")).strip() or "unknown"
+            if position_speaker.lower() in {"unknown", "unclear", "ambiguous", "multiple", "mixed"}:
+                continue
 
             card_text = "\n".join(
                 [
                     f"Claim: {position.get('claim', '').strip()}",
-                    f"Speaker: {position.get('speaker', 'unknown')}",
+                    f"Speaker: {position_speaker}",
+                    f"Episode Date: {episode_date or 'unknown'}",
+                    f"Evidence Time: {format_seconds(evidence_start)}-{format_seconds(evidence_end)}",
                     f"Category: {position.get('stance_category', 'unspecified')}",
                     f"Confidence: {position.get('confidence', 'unknown')}",
                     f"Rationale: {position.get('rationale', '').strip()}",
@@ -1093,17 +1219,21 @@ class PodcastRagPipeline:
                         "source": thesis_meta["source"],
                         "episode_id": thesis_meta["episode_id"],
                         "episode_title": thesis_meta["episode_title"],
+                        "episode_date": episode_date,
+                        "episode_date_compact": compact_episode_date(episode_date) or thesis_meta.get("episode_date_compact"),
+                        "episode_sort_key": episode_sort_key(episode_date) or thesis_meta.get("episode_sort_key"),
                         "source_type": thesis_meta["source_type"],
                         "position_index": idx,
                         "claim": position.get("claim", "").strip(),
-                        "speaker": position.get("speaker", "unknown"),
+                        "speaker": position_speaker,
+                        "speaker_scope": "single" if position_speaker != "unknown" else "unknown",
                         "stance_category": position.get("stance_category", "unspecified"),
                         "confidence": position.get("confidence", "unknown"),
                         "evidence_timestamps": evidence_times,
                         "keywords": keywords,
-                        "start_time": thesis_meta.get("start_time"),
-                        "end_time": thesis_meta.get("end_time"),
-                        "speakers": thesis_meta.get("speakers", []),
+                        "start_time": evidence_start,
+                        "end_time": evidence_end,
+                        "speakers": [position_speaker] if position_speaker != "unknown" else [],
                     },
                 )
             )
@@ -1132,6 +1262,10 @@ class PodcastRagPipeline:
                 bad.append(f"{node_id} ({node_type}) has empty page_content")
             elif node_type in {"cluster_summary", "episode_thesis", "position_card"} and is_missing_context_response(doc.page_content):
                 bad.append(f"{node_id} ({node_type}) has a missing-context response")
+            if not doc.metadata.get("episode_date"):
+                bad.append(f"{node_id} ({node_type}) is missing episode_date")
+            if node_type in {"leaf_chunk", "cluster_summary", "episode_thesis", "position_card"} and not doc.metadata.get("speaker_scope"):
+                bad.append(f"{node_id} ({node_type}) is missing speaker_scope")
 
         if bad:
             preview = "; ".join(bad[:10])
