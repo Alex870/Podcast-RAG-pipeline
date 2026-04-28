@@ -29,6 +29,8 @@
   "leaf_chunk_size": 1800,
   "leaf_chunk_overlap": 250,
   "max_position_source_docs": 40,
+  "position_extraction_batch_char_budget": 8000,
+  "position_passage_max_chars": 900,
   "embedding_batch_size": 64,
   "llm_max_tokens": 4096
 }

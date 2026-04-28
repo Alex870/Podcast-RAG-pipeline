@@ -79,6 +79,8 @@ class PipelineConfig:
     llm_max_tokens: int = 4096
     max_reduction_rounds: int = 8
     summary_target_chars: int = 1600
+    position_extraction_batch_char_budget: int = 8000
+    position_passage_max_chars: int = 900
 
 
 class PipelineInterrupted(Exception):
@@ -1146,18 +1148,19 @@ class PodcastRagPipeline:
         return all_nodes, thesis_doc
 
     def build_position_source_docs(self, all_nodes: list[Document], thesis_doc: Document) -> list[Document]:
-        candidates = [doc for doc in all_nodes if doc.metadata["node_type"] in {"cluster_summary", "episode_thesis"}]
+        candidates = [doc for doc in all_nodes if doc.metadata["node_type"] == "cluster_summary"]
         candidates.sort(
             key=lambda doc: (
-                doc.metadata["node_type"] != "episode_thesis",
+                doc.metadata.get("speaker_scope") != "single",
                 doc.metadata.get("start_time") is None,
                 doc.metadata.get("start_time") or 0.0,
+                len(doc.page_content or ""),
             )
         )
 
         trimmed = candidates[: self.config.max_position_source_docs]
-        if thesis_doc not in trimmed:
-            trimmed = [thesis_doc] + trimmed[: self.config.max_position_source_docs - 1]
+        if not trimmed:
+            return [thesis_doc]
         return trimmed
 
     def render_position_passage(self, doc: Document) -> str:
@@ -1170,28 +1173,58 @@ class PodcastRagPipeline:
             "speaker_scope": metadata.get("speaker_scope") or "unknown",
             "speaker": metadata.get("speaker") or "",
             "speakers": metadata.get("speakers") or [],
-            "text": short_text(doc.page_content, max_chars=1200),
+            "text": short_text(doc.page_content, max_chars=max(300, int(self.config.position_passage_max_chars))),
         }
         return json.dumps(payload, ensure_ascii=True)
 
-    def extract_positions(self, all_nodes: list[Document], thesis_doc: Document) -> list[Document]:
-        source_docs = self.build_position_source_docs(all_nodes, thesis_doc)
-        prompt_text = "\n".join(self.render_position_passage(doc) for doc in source_docs)
-        node_lookup = {doc.metadata.get("node_id"): doc for doc in all_nodes if doc.metadata.get("node_id")}
+    def build_position_batches(self, source_docs: list[Document]) -> list[list[Document]]:
+        budget = max(2000, int(self.config.position_extraction_batch_char_budget or 8000))
+        batches = []
+        current = []
+        current_size = 0
 
-        raw = self.invoke_llm(self.position_chain, prompt_text, "position extraction")
+        for doc in source_docs:
+            rendered_size = len(self.render_position_passage(doc)) + 1
+            if current and current_size + rendered_size > budget:
+                batches.append(current)
+                current = [doc]
+                current_size = rendered_size
+            else:
+                current.append(doc)
+                current_size += rendered_size
+
+        if current:
+            batches.append(current)
+        return batches
+
+    def parse_position_payload(self, raw: str, label: str) -> list[dict[str, Any]]:
         payload = extract_json_payload(raw)
         positions = payload.get("positions") if isinstance(payload, dict) else payload
         if not isinstance(positions, list):
-            print("Position extraction returned non-list payload; skipping position cards")
+            print(f"{label} returned non-list payload; skipping")
             return []
+        return [position for position in positions if isinstance(position, dict) and position.get("claim")]
+
+    def extract_positions(self, all_nodes: list[Document], thesis_doc: Document) -> list[Document]:
+        source_docs = self.build_position_source_docs(all_nodes, thesis_doc)
+        batches = self.build_position_batches(source_docs)
+        node_lookup = {doc.metadata.get("node_id"): doc for doc in all_nodes if doc.metadata.get("node_id")}
+
+        positions = []
+        for batch_idx, batch in enumerate(batches, 1):
+            prompt_text = "\n".join(self.render_position_passage(doc) for doc in batch)
+            label = "position extraction" if len(batches) == 1 else f"position extraction batch {batch_idx}"
+            print(
+                f"  {label}: {len(batch)} source doc(s), "
+                f"{len(prompt_text)} prompt chars"
+            )
+            raw = self.invoke_llm(self.position_chain, prompt_text, label)
+            positions.extend(self.parse_position_payload(raw, label))
 
         thesis_meta = thesis_doc.metadata
         docs = []
+        seen_position_keys = set()
         for idx, position in enumerate(positions):
-            if not isinstance(position, dict) or not position.get("claim"):
-                continue
-
             evidence_ids = [item for item in position.get("evidence_node_ids", []) if isinstance(item, str)]
             evidence_docs = [node_lookup[node_id] for node_id in evidence_ids if node_id in node_lookup]
             evidence_times = [item for item in position.get("evidence_timestamps", []) if isinstance(item, str)]
@@ -1202,6 +1235,14 @@ class PodcastRagPipeline:
             position_speaker = str(position.get("speaker", "unknown")).strip() or "unknown"
             if position_speaker.lower() in {"unknown", "unclear", "ambiguous", "multiple", "mixed"}:
                 continue
+            position_key = (
+                position_speaker.lower(),
+                (episode_date or "").lower(),
+                re.sub(r"\s+", " ", position.get("claim", "").strip().lower()),
+            )
+            if position_key in seen_position_keys:
+                continue
+            seen_position_keys.add(position_key)
 
             card_text = "\n".join(
                 [
