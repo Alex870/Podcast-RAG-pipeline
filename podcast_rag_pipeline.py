@@ -77,6 +77,8 @@ class PipelineConfig:
     llm_max_tokens: int = 4096
     max_reduction_rounds: int = 8
     summary_target_chars: int = 1600
+    episode_thesis_reduce_with_llm: bool = False
+    episode_thesis_max_chars: int = 3200
     position_extraction_batch_char_budget: int = 8000
     position_passage_max_chars: int = 900
 
@@ -524,6 +526,76 @@ def compact_reduced_summaries(summaries: list[str], label: str, max_chars: int) 
         raise ValueError(f"{label} had no reduced summaries to compact.")
     combined = " ".join(parts)
     return f"Deterministic compacted summary for {label}: {clip_text(combined, max_chars)}"
+
+
+def extract_summary_bullets(text: str) -> list[str]:
+    bullets = []
+    current = ""
+    for raw_line in (text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if re.match(r"^[-*]\s+", line):
+            if current:
+                bullets.append(current.strip())
+            current = re.sub(r"^[-*]\s+", "- ", line)
+        elif current:
+            current = f"{current} {line}"
+        else:
+            bullets.append(f"- {line}")
+    if current:
+        bullets.append(current.strip())
+    return bullets
+
+
+def deterministic_episode_overview(docs: list[Any], max_chars: int) -> str:
+    max_chars = max(800, int(max_chars or 3200))
+    heading = "Deterministic episode overview:\n"
+    selected = []
+    seen = set()
+
+    for doc in docs:
+        metadata = getattr(doc, "metadata", {}) or {}
+        prefix_parts = []
+        if metadata.get("episode_date_compact"):
+            prefix_parts.append(str(metadata["episode_date_compact"]))
+        if metadata.get("speaker_scope") == "single" and metadata.get("speaker"):
+            prefix_parts.append(str(metadata["speaker"]))
+        elif metadata.get("speakers"):
+            prefix_parts.append(", ".join(str(speaker) for speaker in metadata["speakers"][:4]))
+        prefix = f"[{'; '.join(prefix_parts)}] " if prefix_parts else ""
+
+        for bullet in extract_summary_bullets(getattr(doc, "page_content", "")):
+            bullet = re.sub(r"\s+", " ", bullet).strip()
+            if not bullet:
+                continue
+            if not bullet.startswith("- "):
+                bullet = f"- {bullet}"
+            normalized = re.sub(r"[^a-z0-9]+", " ", bullet.lower()).strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            selected.append(f"- {prefix}{bullet[2:].strip()}")
+
+    if not selected:
+        return compact_reduced_summaries(
+            [getattr(doc, "page_content", "") for doc in docs],
+            "episode overview",
+            max_chars=max_chars,
+        )
+
+    output_lines = []
+    used_chars = len(heading)
+    for line in selected:
+        next_chars = len(line) + 1
+        if output_lines and used_chars + next_chars > max_chars:
+            break
+        if not output_lines and used_chars + next_chars > max_chars:
+            line = f"- {clip_text(line[2:], max_chars=max_chars - used_chars - 4)}"
+        output_lines.append(line)
+        used_chars += next_chars
+
+    return heading + "\n".join(output_lines)
 
 
 def coerce_text(value: Any) -> str:
@@ -1280,7 +1352,14 @@ class PodcastRagPipeline:
             current_level_docs = summaries
 
         thesis_inputs = latest_summaries or leaf_chunks
-        thesis_text = self.summarize_documents(thesis_inputs, self.thesis_chain, "episode thesis")
+        if self.config.episode_thesis_reduce_with_llm:
+            thesis_text = self.summarize_documents(thesis_inputs, self.thesis_chain, "episode thesis")
+        else:
+            thesis_text = deterministic_episode_overview(thesis_inputs, self.config.episode_thesis_max_chars)
+            print(
+                f"  built deterministic episode overview from {len(thesis_inputs)} source node(s); "
+                "skipped lossy LLM thesis reduction"
+            )
         thesis_speakers = merge_speaker_values(
             speaker
             for doc in leaf_chunks

@@ -114,6 +114,8 @@ Rejected LLM responses and fallback events are written to `debug_output` as JSON
 
 For Qwen reasoning models in LM Studio, keep `llm_max_tokens` high enough for hidden reasoning plus final answer text. With `unsloth/qwen3.6-35b-a3b`, `4096` has been more reliable than `2048` even when `/no_think` is present.
 
+By default, the final `episode_thesis` document is a deterministic bounded overview instead of another LLM reduction pass. This avoids throwing away speaker/date resolution at the end of a long episode. The retrieval-grade evidence remains in `leaf_chunk`, `cluster_summary`, and `position_card` documents. Set `episode_thesis_reduce_with_llm` to `true` if you want the older LLM-generated thesis behavior.
+
 By default, input JSON files are not moved after processing. Set `move_processed_files` to `true` if you prefer the older workflow where processed files are moved to `processed`.
 
 ## Direct Python Usage
