@@ -14,7 +14,7 @@ For overnight batch processing, local LM Studio processing is the sensible defau
 
 The current local batch benchmark used LM Studio with `mistral-small-3.2-24b-instruct-2506` on an RTX 5070 Ti. Across 19 completed processed-data caches from one batch run, the pipeline processed about 88.4 hours of podcast audio in 16.8 hours of recorded processing time, or about 11.4 minutes of processing per podcast hour. That is roughly 5.3x faster than real time for this workload.
 
-This benchmark is based on `state/podcast_rag_state.json` elapsed seconds and episode durations inferred from `leaf_chunk` start/end metadata in `processed_data`. The same run produced 9,991 documents and 379 position cards.
+This benchmark is based on `state/podcast_rag_state.json` elapsed seconds and episode durations inferred from `leaf_chunk` start/end metadata in `processed_data`. The same run produced 9,991 documents and 379 position cards. The maximum observed request size was 3,736 total tokens, so a minimum LM Studio context length of 4,096 tokens is advisable for this workload.
 
 ## Repository Contents
 
