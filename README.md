@@ -10,6 +10,12 @@ The default workflow targets a local LM Studio server on Windows 11 using LM Stu
 
 For overnight batch processing, local LM Studio processing is the sensible default. A cloud RTX 6000 Pro with 96 GB VRAM may let you run a larger model, a longer context, or more concurrent work, but this pipeline is designed to reduce long transcripts into bounded chunks and summaries. Unless you have a specific larger model in mind that materially improves the summaries, the expected quality gain is probably smaller than the operational cost for routine batches.
 
+## Batch Performance Snapshot
+
+The current local batch benchmark used LM Studio with `mistral-small-3.2-24b-instruct-2506` on an RTX 5070 Ti. Across 19 completed processed-data caches from one batch run, the pipeline processed about 88.4 hours of podcast audio in 16.8 hours of recorded processing time, or about 11.4 minutes of processing per podcast hour. That is roughly 5.3x faster than real time for this workload.
+
+This benchmark is based on `state/podcast_rag_state.json` elapsed seconds and episode durations inferred from `leaf_chunk` start/end metadata in `processed_data`. The same run produced 9,991 documents and 379 position cards.
+
 ## Repository Contents
 
 - `podcast_rag_pipeline.py`: main restartable preprocessing pipeline
