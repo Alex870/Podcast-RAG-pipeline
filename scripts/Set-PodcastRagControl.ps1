@@ -3,9 +3,26 @@ param(
     [int]$MaxParallelModelRequests
 )
 
-$ProjectRoot = $PSScriptRoot
+function Wait-ForExitPrompt {
+    if (-not $env:PODCAST_RAG_SUPPRESS_PAUSE -and $Host.Name -eq "ConsoleHost") {
+        [void](Read-Host "Press Enter to continue")
+    }
+}
+
+function Exit-Script {
+    param([int]$Code = 0)
+    Wait-ForExitPrompt
+    exit $Code
+}
+
+trap {
+    Write-Error $_
+    Exit-Script 1
+}
+
+$ProjectRoot = Split-Path -Parent $PSScriptRoot
 $ConfigPath = Join-Path $ProjectRoot "podcast_rag_config.json"
-$ConfigExamplePath = Join-Path $ProjectRoot "podcast_rag_config.example.json"
+$ConfigExamplePath = Join-Path $ProjectRoot "examples\podcast_rag_config.example.json"
 
 if (-not $Config) {
     $Config = if (Test-Path -LiteralPath $ConfigPath) { $ConfigPath } else { $ConfigExamplePath }
@@ -38,4 +55,4 @@ $payload = [ordered]@{
 
 $payload | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $controlPath -Encoding UTF8
 Write-Host "Set max_parallel_model_requests=$MaxParallelModelRequests in $controlPath"
-
+Exit-Script 0

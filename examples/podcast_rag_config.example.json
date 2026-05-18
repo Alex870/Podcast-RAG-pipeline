@@ -32,5 +32,22 @@
   "position_extraction_batch_char_budget": 8000,
   "position_passage_max_chars": 900,
   "embedding_batch_size": 64,
-  "llm_max_tokens": 4096
+  "llm_max_tokens": 4096,
+  "context_window_tokens": 4096,
+  "prompt_token_budget": 3500,
+  "prompt_token_chars_per_token": 4.0,
+  "resume_within_file": true,
+  "checkpoint_dir": "state/file_checkpoints",
+  "run_report_dir": "state/run_reports",
+  "run_snapshot_path": "state/current_run_snapshot.json",
+  "cache_schema_version": "2.0",
+  "clustering_reduction": "pca",
+  "grouping_mode": "semantic",
+  "summary_objective": "speaker_belief",
+  "enable_llm_topic_tags": false,
+  "deterministic_topic_count": 8,
+  "near_duplicate_threshold": 0.92,
+  "position_quote_excerpt_chars": 360,
+  "fake_llm": false,
+  "model_eval_output_dir": "model_eval"
 }

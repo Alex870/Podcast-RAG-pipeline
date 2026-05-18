@@ -7,12 +7,29 @@ param(
     [switch]$SkipInferenceTest
 )
 
+function Wait-ForExitPrompt {
+    if (-not $env:PODCAST_RAG_SUPPRESS_PAUSE -and $Host.Name -eq "ConsoleHost") {
+        [void](Read-Host "Press Enter to continue")
+    }
+}
+
+function Exit-Script {
+    param([int]$Code = 0)
+    Wait-ForExitPrompt
+    exit $Code
+}
+
+trap {
+    Write-Error $_
+    Exit-Script 1
+}
+
 $ErrorActionPreference = "Continue"
 
-$ProjectRoot = $PSScriptRoot
+$ProjectRoot = Split-Path -Parent $PSScriptRoot
 $PythonScript = Join-Path $ProjectRoot "podcast_rag_pipeline.py"
 $ConfigPath = Join-Path $ProjectRoot "podcast_rag_config.json"
-$ConfigExamplePath = Join-Path $ProjectRoot "podcast_rag_config.example.json"
+$ConfigExamplePath = Join-Path $ProjectRoot "examples\podcast_rag_config.example.json"
 $RequirementsPath = Join-Path $ProjectRoot "podcast_rag_requirements.txt"
 
 if (-not $Config) {
@@ -150,7 +167,7 @@ if (Get-Command conda -ErrorAction SilentlyContinue) {
         }
 
         if (-not $condaEnvFound) {
-            Write-Check -Status FAIL -Name "Conda environment" -Detail "Missing '$CondaEnvName'. Run: .\Run Podcast RAG Pipeline.ps1 -CreateCondaEnv"
+            Write-Check -Status FAIL -Name "Conda environment" -Detail "Missing '$CondaEnvName'. Run: .\scripts\Run-PodcastRagPipeline.ps1 -CreateCondaEnv"
         }
     } catch {
         Write-Check -Status FAIL -Name "Conda environment list" -Detail $_.Exception.Message
@@ -192,6 +209,7 @@ modules = [
     ("openai", "openai"),
     ("sklearn", "scikit-learn"),
     ("sentence_transformers", "sentence-transformers"),
+    ("umap", "umap-learn"),
 ]
 
 failures = []
@@ -337,13 +355,13 @@ try {
 Write-Host ""
 if ($script:Failed -gt 0) {
     Write-Host ("Diagnostic failed with {0} failure(s) and {1} warning(s)." -f $script:Failed, $script:Warned) -ForegroundColor Red
-    exit 1
+    Exit-Script 1
 }
 
 if ($script:Warned -gt 0) {
     Write-Host ("Diagnostic passed with {0} warning(s)." -f $script:Warned) -ForegroundColor Yellow
-    exit 0
+    Exit-Script 0
 }
 
 Write-Host "Diagnostic passed with no warnings." -ForegroundColor Green
-exit 0
+Exit-Script 0

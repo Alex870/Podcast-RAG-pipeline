@@ -2,10 +2,27 @@ param(
     [string]$ProcessedDataDir
 )
 
-$ProjectRoot = $PSScriptRoot
+function Wait-ForExitPrompt {
+    if (-not $env:PODCAST_RAG_SUPPRESS_PAUSE -and $Host.Name -eq "ConsoleHost") {
+        [void](Read-Host "Press Enter to continue")
+    }
+}
+
+function Exit-Script {
+    param([int]$Code = 0)
+    Wait-ForExitPrompt
+    exit $Code
+}
+
+trap {
+    Write-Error $_
+    Exit-Script 1
+}
+
+$ProjectRoot = Split-Path -Parent $PSScriptRoot
 if (-not $ProcessedDataDir) {
     $configPath = Join-Path $ProjectRoot "podcast_rag_config.json"
-    $examplePath = Join-Path $ProjectRoot "podcast_rag_config.example.json"
+    $examplePath = Join-Path $ProjectRoot "examples\podcast_rag_config.example.json"
     $configToRead = if (Test-Path -LiteralPath $configPath) { $configPath } else { $examplePath }
     $config = Get-Content -LiteralPath $configToRead -Raw | ConvertFrom-Json
     $ProcessedDataDir = if ($config.processed_data_dir) { [string]$config.processed_data_dir } else { "processed_data" }
@@ -17,7 +34,7 @@ if (-not [System.IO.Path]::IsPathRooted($ProcessedDataDir)) {
 
 if (-not (Test-Path -LiteralPath $ProcessedDataDir)) {
     Write-Host "Processed data directory does not exist: $ProcessedDataDir"
-    exit 0
+    Exit-Script 0
 }
 
 $patterns = @(
@@ -60,11 +77,11 @@ foreach ($file in Get-ChildItem -LiteralPath $ProcessedDataDir -Filter "*.json" 
 
 if ($badFiles.Count -eq 0) {
     Write-Host "No missing-context summaries found in $ProcessedDataDir" -ForegroundColor Green
-    exit 0
+    Exit-Script 0
 }
 
 Write-Host "Found invalid processed data cache content in $($badFiles.Count) file(s):" -ForegroundColor Yellow
 $badFiles | Sort-Object | ForEach-Object { Write-Host "  $_" }
 Write-Host ""
 Write-Host "Delete those cache file(s) and rerun the pipeline to rebuild them with the new validation."
-exit 1
+Exit-Script 1

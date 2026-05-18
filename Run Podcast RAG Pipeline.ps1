@@ -1,187 +1,127 @@
 param(
-    [string]$Config,
-    [string]$CondaEnvName = "podcast-rag-pipeline",
-    [string]$InputDir,
-    [string]$FileGlob,
-    [string]$Model,
-    [string]$BaseUrl,
-    [int]$MaxParallelModelRequests,
-    [switch]$OneFile,
-    [switch]$CreateStopFile,
-    [switch]$ClearStopFile,
-    [switch]$CreateCondaEnv,
-    [switch]$SkipDependencyCheck
+    [ValidateSet("Prompt", "Run", "Debug", "CacheCheck", "SetControl", "CreateStopFile", "ClearStopFile", "CreateCondaEnv")]
+    [string]$Action = "Prompt",
+    [int]$MaxParallelModelRequests
 )
 
-$PythonScript = Join-Path $PSScriptRoot "podcast_rag_pipeline.py"
-$ConfigPath = Join-Path $PSScriptRoot "podcast_rag_config.json"
-$ConfigExamplePath = Join-Path $PSScriptRoot "podcast_rag_config.example.json"
-$RequirementsPath = Join-Path $PSScriptRoot "podcast_rag_requirements.txt"
-
-if (-not $Config) {
-    $Config = $ConfigPath
+function Wait-ForExitPrompt {
+    if (-not $env:PODCAST_RAG_SUPPRESS_PAUSE -and $Host.Name -eq "ConsoleHost") {
+        [void](Read-Host "Press Enter to continue")
+    }
 }
 
-function Invoke-ProjectPython {
+function Exit-Script {
+    param([int]$Code = 0)
+    Wait-ForExitPrompt
+    exit $Code
+}
+
+trap {
+    Write-Error $_
+    Exit-Script 1
+}
+
+$ScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$RunScript = Join-Path $ScriptRoot "scripts\Run-PodcastRagPipeline.ps1"
+$DebugScript = Join-Path $ScriptRoot "scripts\Test-PodcastRagEnvironment.ps1"
+$CacheScript = Join-Path $ScriptRoot "scripts\Test-ProcessedDataCache.ps1"
+$ControlScript = Join-Path $ScriptRoot "scripts\Set-PodcastRagControl.ps1"
+
+function Invoke-LauncherScript {
     param(
-        [string[]]$Arguments
+        [string]$Path,
+        [hashtable]$Parameters = @{}
     )
 
-    & conda run --no-capture-output -n $CondaEnvName python @Arguments
-}
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "Missing launcher script: $Path"
+    }
 
-function Test-CondaEnv {
-    $envListJson = & conda env list --json | ConvertFrom-Json
-    foreach ($envPath in $envListJson.envs) {
-        if ((Split-Path -Leaf $envPath) -eq $CondaEnvName) {
-            return $true
+    $previousSuppressPause = $env:PODCAST_RAG_SUPPRESS_PAUSE
+    $env:PODCAST_RAG_SUPPRESS_PAUSE = "1"
+    try {
+        & $Path @Parameters
+        $childExitCode = $LASTEXITCODE
+    } finally {
+        if ($null -eq $previousSuppressPause) {
+            Remove-Item Env:PODCAST_RAG_SUPPRESS_PAUSE -ErrorAction SilentlyContinue
+        } else {
+            $env:PODCAST_RAG_SUPPRESS_PAUSE = $previousSuppressPause
         }
     }
-    return $false
+
+    Exit-Script $childExitCode
 }
 
-function New-ProjectCondaEnv {
-    if (Test-CondaEnv) {
-        Write-Host "Conda environment already exists: $CondaEnvName"
-        return
-    }
+function Read-PositiveInteger {
+    param(
+        [string]$Prompt
+    )
 
-    & conda create -y -n $CondaEnvName python=3.11 pip
-    if ($LASTEXITCODE -eq 0) {
-        & conda run --no-capture-output -n $CondaEnvName python -m pip install --upgrade pip
-    }
-    if ($LASTEXITCODE -eq 0) {
-        & conda run --no-capture-output -n $CondaEnvName python -m pip install -r $RequirementsPath
-    }
-
-    if ($LASTEXITCODE -ne 0) {
-        exit $LASTEXITCODE
+    while ($true) {
+        $inputValue = (Read-Host $Prompt).Trim()
+        if ([int]::TryParse($inputValue, [ref]$parsedValue) -and $parsedValue -ge 1) {
+            return $parsedValue
+        }
+        Write-Host "Please enter an integer value of 1 or higher." -ForegroundColor Yellow
     }
 }
 
-function Test-PythonDependencies {
-    $dependencyCheckPath = Join-Path ([System.IO.Path]::GetTempPath()) ("podcast_rag_dependency_check_{0}.py" -f [guid]::NewGuid().ToString("N"))
-    @"
-import importlib
-import sys
+if ($Action -eq "Prompt") {
+    Write-Host ""
+    Write-Host "Podcast RAG Pipeline"
+    Write-Host "Choose what to run:"
+    Write-Host "  1. Run environment validation"
+    Write-Host "  2. Run the main RAG pipeline"
+    Write-Host "  3. Check processed-data cache health"
+    Write-Host "  4. Set live max_parallel_model_requests"
+    Write-Host "  5. Create stop-after-current-file request"
+    Write-Host "  6. Clear stop-after-current-file request"
+    Write-Host "  7. Create or refresh the Conda environment"
+    Write-Host "  Q. Quit"
+    $selection = (Read-Host "Enter 1, 2, 3, 4, 5, 6, 7, or Q").Trim()
 
-required = [
-    'hdbscan',
-    'langchain_community',
-    'langchain_huggingface',
-    'langchain_openai',
-    'numpy',
-    'openai',
-    'sklearn',
-]
-missing = []
-for name in required:
-    try:
-        importlib.import_module(name)
-    except Exception as exc:
-        missing.append(f'{name}: {type(exc).__name__}: {exc}')
-
-if missing:
-    print('MISSING:' + '|'.join(missing))
-    sys.exit(1)
-"@ | Set-Content -LiteralPath $dependencyCheckPath -Encoding UTF8
-
-    try {
-        Invoke-ProjectPython -Arguments @($dependencyCheckPath)
-        return $LASTEXITCODE
-    } finally {
-        Remove-Item -LiteralPath $dependencyCheckPath -Force -ErrorAction SilentlyContinue
+    switch ($selection.ToUpperInvariant()) {
+        "1" { $Action = "Debug" }
+        "2" { $Action = "Run" }
+        "3" { $Action = "CacheCheck" }
+        "4" { $Action = "SetControl" }
+        "5" { $Action = "CreateStopFile" }
+        "6" { $Action = "ClearStopFile" }
+        "7" { $Action = "CreateCondaEnv" }
+        "Q" { Exit-Script 0 }
+        default {
+            Write-Host "Unrecognized selection. Exiting."
+            Exit-Script 1
+        }
     }
 }
 
-if (-not (Get-Command conda -ErrorAction SilentlyContinue)) {
-    throw "Conda was not found on PATH. Open a Miniconda/Anaconda PowerShell prompt, or add Conda to PATH."
-}
-
-if (-not (Test-Path -LiteralPath $Config)) {
-    if (-not (Test-Path -LiteralPath $ConfigExamplePath)) {
-        throw "Missing config file and example config: $ConfigExamplePath"
+switch ($Action) {
+    "Debug" {
+        Invoke-LauncherScript -Path $DebugScript
     }
-
-    Copy-Item -LiteralPath $ConfigExamplePath -Destination $Config
-    Write-Host "Created config: $Config"
-}
-
-if ($CreateStopFile) {
-    $configObject = Get-Content -LiteralPath $Config -Raw | ConvertFrom-Json
-    $stopPath = if ($configObject.stop_file) { [string]$configObject.stop_file } else { "state/stop_after_current.txt" }
-    if (-not [System.IO.Path]::IsPathRooted($stopPath)) {
-        $stopPath = Join-Path $PSScriptRoot $stopPath
+    "Run" {
+        Invoke-LauncherScript -Path $RunScript
     }
-    $stopDir = Split-Path -Parent $stopPath
-    if ($stopDir -and -not (Test-Path -LiteralPath $stopDir)) {
-        New-Item -ItemType Directory -Path $stopDir | Out-Null
+    "CacheCheck" {
+        Invoke-LauncherScript -Path $CacheScript
     }
-    "Stop requested at $(Get-Date -Format o)" | Set-Content -LiteralPath $stopPath -Encoding UTF8
-    Write-Host "Created stop file: $stopPath"
-    exit 0
-}
-
-if ($ClearStopFile) {
-    $configObject = Get-Content -LiteralPath $Config -Raw | ConvertFrom-Json
-    $stopPath = if ($configObject.stop_file) { [string]$configObject.stop_file } else { "state/stop_after_current.txt" }
-    if (-not [System.IO.Path]::IsPathRooted($stopPath)) {
-        $stopPath = Join-Path $PSScriptRoot $stopPath
+    "SetControl" {
+        if (-not $MaxParallelModelRequests -or $MaxParallelModelRequests -lt 1) {
+            $MaxParallelModelRequests = Read-PositiveInteger -Prompt "Enter max_parallel_model_requests"
+        }
+        Invoke-LauncherScript -Path $ControlScript -Parameters @{ MaxParallelModelRequests = $MaxParallelModelRequests }
     }
-    if (Test-Path -LiteralPath $stopPath) {
-        Remove-Item -LiteralPath $stopPath
-        Write-Host "Removed stop file: $stopPath"
+    "CreateStopFile" {
+        Invoke-LauncherScript -Path $RunScript -Parameters @{ CreateStopFile = $true }
+    }
+    "ClearStopFile" {
+        Invoke-LauncherScript -Path $RunScript -Parameters @{ ClearStopFile = $true }
+    }
+    "CreateCondaEnv" {
+        Invoke-LauncherScript -Path $RunScript -Parameters @{ CreateCondaEnv = $true }
     }
 }
 
-if ($CreateCondaEnv) {
-    New-ProjectCondaEnv
-    exit 0
-}
-
-if (-not (Test-CondaEnv)) {
-    Write-Host "Conda environment '$CondaEnvName' was not found."
-    Write-Host "Create it with:"
-    Write-Host "  .\Run Podcast RAG Pipeline.ps1 -CreateCondaEnv"
-    exit 1
-}
-
-if (-not $SkipDependencyCheck) {
-    $dependencyExitCode = Test-PythonDependencies
-    if ($dependencyExitCode -ne 0) {
-        Write-Host ""
-        Write-Host "Python dependencies are missing. Install them with:"
-        Write-Host "  conda run -n $CondaEnvName python -m pip install -r `"$RequirementsPath`""
-        exit $dependencyExitCode
-    }
-}
-
-$argsList = @("--config", $Config)
-
-if ($InputDir) {
-    $argsList += @("--input-dir", $InputDir)
-}
-
-if ($FileGlob) {
-    $argsList += @("--file-glob", $FileGlob)
-}
-
-if ($Model) {
-    $argsList += @("--model", $Model)
-}
-
-if ($BaseUrl) {
-    $argsList += @("--base-url", $BaseUrl)
-}
-
-if ($MaxParallelModelRequests) {
-    $argsList += @("--max-parallel-model-requests", $MaxParallelModelRequests)
-}
-
-if ($OneFile) {
-    $argsList += "--one-file"
-}
-
-$pythonArgs = @($PythonScript) + $argsList
-Invoke-ProjectPython -Arguments $pythonArgs
-exit $LASTEXITCODE
+Exit-Script 0

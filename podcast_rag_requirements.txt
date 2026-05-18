@@ -9,3 +9,4 @@ numpy
 openai
 scikit-learn
 sentence-transformers
+umap-learn

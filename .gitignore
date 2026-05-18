@@ -7,7 +7,15 @@ debug_output/
 chroma_db*/
 state/
 logs/
+model_eval/
 *.pyc
 __pycache__/
 .venv/
 .pytest_cache/
+.test_tmp/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+.coverage
