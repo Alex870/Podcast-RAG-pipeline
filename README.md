@@ -2,9 +2,11 @@
 
 This project builds pre-processed podcast RAG documents from JSON transcript files produced by `podcast_transcribe_host.py` (in the [Podcast-Host-Transcription-Pipeline](https://github.com/Alex870/Podcast-Host-Transcription-Pipeline) repository). It creates leaf chunks, RAPTOR-style rollup summaries, episode thesis summaries, and durable position cards, then saves them as processed JSON caches.
 
+It also derives a lightweight topic index from those processed caches so downstream tools such as `PodCast Chat` can browse recurring themes, estimate topic depth, and ask evolution-over-time questions without re-running the full expensive transcript pipeline.
+
 The output of this process is then loaded into a Vector database in the `Chroma DB Import` project. This division keeps expensive LLM preprocessing separate from Chroma database rebuilds.
 
-The default workflow targets a local LM Studio server running on Windows 11 using LM Studio's OpenAI-compatible API. The included example config defaults to `http://127.0.0.1:1234/v1` with `unsloth/qwen3.6-35b-a3b`, but both values are configurable.
+The default workflow targets a local LM Studio server running on Windows 11 using LM Studio's OpenAI-compatible API. The included example config defaults to `http://127.0.0.1:1234/v1` with `mistral-small-3.2-24b-instruct-2506`, but both values are configurable.
 
 The shared transcript, processed-cache, Chroma metadata, and `podcast.json` expectations are documented in [`docs/podcast_pipeline_contract.md`](docs/podcast_pipeline_contract.md).
 
@@ -23,6 +25,7 @@ This benchmark is based on `state/podcast_rag_state.json` elapsed seconds and ep
 - `src/podcast_rag/`: package source, split into config, runtime, transcript ingestion, cache/state IO, orchestration, and CLI modules
 - `Run Podcast RAG Pipeline.ps1`: root bootstrap launcher for the most common setup, validation, control, and run actions
 - `scripts/`: PowerShell launchers and diagnostics for Windows-first operation
+- `scripts/Migrate-LegacyPodcastRagState.ps1`: guided migration assistant for importing config, caches, state, and repo-local input data from a legacy working directory
 - `examples/`: editable runtime configuration template
 - `docs/`: schema and architecture notes
 - `tests/`: focused unit coverage for schema validation and helper behavior
@@ -36,6 +39,7 @@ This benchmark is based on `state/podcast_rag_state.json` elapsed seconds and ep
 - `transcript.py`: transcript JSON normalization and episode metadata extraction
 - `text_utils.py`: deterministic text, date, token, and fallback helpers shared across stages
 - `state.py`: durable state, checkpoints, processed-cache IO, and run-report writing
+- `topics.py`: cache-only topic contribution extraction, delta tracking, and aggregate topic index generation
 - `pipeline.py`: the `PodcastRagPipeline` orchestration class for chunking, summarization, clustering, and position extraction
 - `cli.py`: batch execution, cache inspection, config doctor, and model evaluation entry points
 
@@ -77,6 +81,24 @@ To start the main batch pipeline:
 
 Choose `2` for the main pipeline. The menu also exposes processed-cache inspection, live control updates, stop-file management, and Conda environment creation. The main pipeline launcher still creates `podcast_rag_config.json` from the example if needed, applies optional command-line overrides, checks Python dependencies, and runs the pipeline.
 
+To build or refresh the topic index from already-processed caches without re-running the main pipeline:
+
+```powershell
+.\Run Podcast RAG Pipeline.ps1
+```
+
+Choose `8` for `Build or refresh the topic index`.
+
+That topic refresh path is intentionally incremental. It scans the existing `processed_data` caches, rebuilds only new or changed per-episode topic contributions, and updates the aggregate `state/topic_index.json` catalog without redoing the expensive transcript summarization work.
+
+If you are starting from a fresh pull but already have an older working directory with expensive caches and state, the bootstrap also exposes a migration assistant:
+
+```powershell
+.\Run Podcast RAG Pipeline.ps1
+```
+
+Choose `9` for `Migrate settings and state from a legacy directory`.
+
 If you prefer to skip the menu, the root launcher also supports direct actions:
 
 ```powershell
@@ -87,6 +109,8 @@ If you prefer to skip the menu, the root launcher also supports direct actions:
 .\Run Podcast RAG Pipeline.ps1 -Action CreateStopFile
 .\Run Podcast RAG Pipeline.ps1 -Action ClearStopFile
 .\Run Podcast RAG Pipeline.ps1 -Action CreateCondaEnv
+.\Run Podcast RAG Pipeline.ps1 -Action BuildTopicIndex
+.\Run Podcast RAG Pipeline.ps1 -Action Migrate
 ```
 
 The underlying PowerShell scripts remain available in `scripts\` when you want to bypass the menu and call a specific launcher directly.
@@ -95,7 +119,7 @@ Useful launcher parameters:
 
 ```powershell
 .\scripts\Run-PodcastRagPipeline.ps1 -InputDir "C:\path\to\transcripts"
-.\scripts\Run-PodcastRagPipeline.ps1 -Model "unsloth/qwen3.6-35b-a3b"
+.\scripts\Run-PodcastRagPipeline.ps1 -Model "mistral-small-3.2-24b-instruct-2506"
 .\scripts\Run-PodcastRagPipeline.ps1 -BaseUrl "http://127.0.0.1:1234/v1"
 .\scripts\Run-PodcastRagPipeline.ps1 -OneFile
 .\scripts\Run-PodcastRagPipeline.ps1 -MaxParallelModelRequests 2
@@ -137,6 +161,10 @@ Progress is tracked in `state/podcast_rag_state.json`. Completed files are skipp
 
 Processed document caches are stored in `processed_data` using the same file fingerprint. When a matching cache exists, the pipeline validates it and skips LLM processing for that transcript. If every pending file has a cache, LM Studio model verification is skipped because no model generation is needed.
 
+The topic index is intentionally built on top of those processed caches. You can backfill topic coverage for a library that already took days to preprocess by running a cheap cache-only topic refresh instead of rerunning LM Studio summarization for every episode. Per-episode topic contributions are stored in `state/topic_contributions`, the aggregate catalog lives at `state/topic_index.json`, and delta tracking lives at `state/topic_index_manifest.json`.
+
+The migration assistant is designed around the same principle. It can copy forward `podcast_rag_config.json`, `processed_data`, configured state artifacts, processed-input archives, optional debug outputs, and repo-local input transcripts from a legacy repo without making you rebuild the expensive caches. When the legacy config used absolute paths inside the old repository tree, the migrator rewrites those values to portable repo-relative paths in the new `podcast_rag_config.json`.
+
 To insert or reinsert processed caches into Chroma, use the separate `Chroma DB Import` project.
 
 Processed caches now use schema version `2.0`. Each cache includes a prompt/version manifest, config fingerprint, model and embedding names, source transcript fingerprint and schema version, stable document IDs, cluster telemetry, fallback counts, token maxima, validation counts, and an import manifest for downstream Chroma import.
@@ -144,6 +172,8 @@ Processed caches now use schema version `2.0`. Each cache includes a prompt/vers
 Within a single file, completed `leaf_chunks`, `hierarchy`, and `positions` stages are checkpointed under `state/file_checkpoints`. If a long episode is interrupted after an expensive stage, the next run can resume from the checkpoint instead of starting over. Set `resume_within_file` to `false` to disable this.
 
 At the end of each batch, structured reports are written to `state/run_reports` as JSON and Markdown. A live dashboard-friendly snapshot is refreshed at `state/current_run_snapshot.json`.
+
+By default, a successful batch also refreshes the topic index automatically. Set `auto_refresh_topic_index` to `false` if you want to keep topic aggregation as a separate step. The optional `podcast_id` and `podcast_name` config values let you override how this corpus is labeled inside the topic index when multiple podcast libraries are merged downstream.
 
 To scan existing caches for missing-context LLM responses:
 
@@ -177,7 +207,7 @@ python .\podcast_rag_pipeline.py --config .\examples\podcast_rag_config.example.
 
 Rejected LLM responses and fallback events are written to `debug_output` as JSON files containing the label, source prompt text, model response, and error reason. These files are ignored by Git.
 
-For Qwen reasoning models in LM Studio, keep `llm_max_tokens` high enough for hidden reasoning plus final answer text. With `unsloth/qwen3.6-35b-a3b`, `4096` has been more reliable than `2048` even when `/no_think` is present.
+For Qwen reasoning models in LM Studio, keep `llm_max_tokens` high enough for hidden reasoning plus final answer text. If you switch away from the default Mistral model to a Qwen reasoning model, `4096` has been more reliable than `2048` even when `/no_think` is present.
 
 By default, the final `episode_thesis` document is a deterministic bounded overview instead of another LLM reduction pass. This avoids throwing away speaker/date resolution at the end of a long episode. The retrieval-grade evidence remains in `leaf_chunk`, `cluster_summary`, and `position_card` documents. Set `episode_thesis_reduce_with_llm` to `true` if you want the older LLM-generated thesis behavior.
 
@@ -191,6 +221,7 @@ By default, input JSON files are not moved after processing. Set `move_processed
 python .\podcast_rag_pipeline.py --config .\podcast_rag_config.json
 python .\podcast_rag_pipeline.py --input-dir "C:\path\to\transcripts" --one-file
 python .\podcast_rag_pipeline.py --create-stop-file
+python .\podcast_rag_pipeline.py --config .\podcast_rag_config.json --build-topic-index
 python .\podcast_rag_pipeline.py --inspect-cache
 python .\podcast_rag_pipeline.py --config-doctor
 python .\podcast_rag_pipeline.py --model-eval --model-eval-limit 3

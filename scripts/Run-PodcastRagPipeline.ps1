@@ -13,6 +13,7 @@ param(
     [switch]$ConfigDoctor,
     [switch]$ModelEval,
     [int]$ModelEvalLimit = 3,
+    [switch]$BuildTopicIndex,
     [switch]$FakeLlm,
     [switch]$CreateCondaEnv,
     [switch]$SkipDependencyCheck
@@ -217,6 +218,10 @@ if ($ConfigDoctor) {
 
 if ($ModelEval) {
     $argsList += @("--model-eval", "--model-eval-limit", $ModelEvalLimit)
+}
+
+if ($BuildTopicIndex) {
+    $argsList += "--build-topic-index"
 }
 
 if ($FakeLlm) {

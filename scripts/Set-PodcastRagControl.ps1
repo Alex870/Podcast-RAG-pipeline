@@ -20,6 +20,16 @@ trap {
     Exit-Script 1
 }
 
+function Write-Utf8NoBomFile {
+    param(
+        [string]$Path,
+        [string]$Content
+    )
+
+    $encoding = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($Path, $Content, $encoding)
+}
+
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 $ConfigPath = Join-Path $ProjectRoot "podcast_rag_config.json"
 $ConfigExamplePath = Join-Path $ProjectRoot "examples\podcast_rag_config.example.json"
@@ -53,6 +63,7 @@ $payload = [ordered]@{
     note = "The running pipeline reloads this file before launching new model requests."
 }
 
-$payload | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $controlPath -Encoding UTF8
+$json = $payload | ConvertTo-Json -Depth 5
+Write-Utf8NoBomFile -Path $controlPath -Content ($json + [Environment]::NewLine)
 Write-Host "Set max_parallel_model_requests=$MaxParallelModelRequests in $controlPath"
 Exit-Script 0

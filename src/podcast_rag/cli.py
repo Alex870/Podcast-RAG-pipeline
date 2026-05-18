@@ -34,6 +34,7 @@ from podcast_rag.text_utils import (
     is_missing_context_response,
     token_estimate,
 )
+from podcast_rag.topics import refresh_topic_index
 from podcast_rag.transcript import iter_transcript_files, load_transcript_json
 
 def run_batch(config: PipelineConfig, project_dir: Path, one_file: bool) -> int:
@@ -178,7 +179,27 @@ def run_batch(config: PipelineConfig, project_dir: Path, one_file: bool) -> int:
     pipeline.performance.final_report()
     json_report, md_report = write_run_reports(report_dir, stats, pipeline.performance, config)
     print(f"Run reports saved: {json_report} and {md_report}")
+    if config.auto_refresh_topic_index:
+        topic_summary = refresh_topic_index(config, project_dir)
+        print(
+            "Topic index refreshed: "
+            f"{topic_summary['topic_count']} topics across {topic_summary['episode_count']} episode contribution(s) "
+            f"({topic_summary['reused_contributions']} reused, {topic_summary['rebuilt_contributions']} rebuilt)."
+        )
+        print(f"Topic index path: {topic_summary['topic_index_path']}")
     print("\nBatch run complete.")
+    return 0
+
+def build_topic_index(config: PipelineConfig, project_dir: Path) -> int:
+    """Build or incrementally refresh the cache-only topic index from processed_data."""
+    summary = refresh_topic_index(config, project_dir)
+    print(
+        "Topic index refreshed: "
+        f"{summary['topic_count']} topics across {summary['episode_count']} episode contribution(s); "
+        f"{summary['reused_contributions']} reused, {summary['rebuilt_contributions']} rebuilt, "
+        f"{summary['removed_contributions']} removed."
+    )
+    print(f"Topic index path: {summary['topic_index_path']}")
     return 0
 
 def inspect_processed_cache(config: PipelineConfig, project_dir: Path) -> int:
@@ -301,6 +322,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config-doctor", action="store_true", help="Validate operational config and LM Studio settings before a batch.")
     parser.add_argument("--model-eval", action="store_true", help="Run the model-evaluation harness on transcript slices.")
     parser.add_argument("--model-eval-limit", type=int, default=3, help="Maximum transcript files to sample for --model-eval.")
+    parser.add_argument("--build-topic-index", action="store_true", help="Build or refresh the cache-only topic index from processed_data.")
     parser.add_argument("--fake-llm", action="store_true", help="Use deterministic fake LLM responses for no-LM Studio validation.")
     return parser.parse_args()
 
@@ -337,5 +359,7 @@ def main() -> int:
         return config_doctor(config, project_dir)
     if args.model_eval:
         return evaluate_model(config, project_dir, args.model_eval_limit)
+    if args.build_topic_index:
+        return build_topic_index(config, project_dir)
 
     return run_batch(config, project_dir, args.one_file)

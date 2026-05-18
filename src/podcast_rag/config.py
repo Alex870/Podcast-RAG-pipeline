@@ -22,7 +22,7 @@ class PipelineConfig:
     embedding_model: str = "BAAI/bge-large-en-v1.5"
     lm_studio_base_url: str = "http://127.0.0.1:1234/v1"
     lm_studio_api_key: str = "lm-studio"
-    lm_studio_model: str = "unsloth/qwen3.6-35b-a3b"
+    lm_studio_model: str = "mistral-small-3.2-24b-instruct-2506"
     verify_model: bool = True
     test_inference: bool = True
     max_threads: int = 2
@@ -51,6 +51,12 @@ class PipelineConfig:
     checkpoint_dir: str = "state/file_checkpoints"
     run_report_dir: str = "state/run_reports"
     run_snapshot_path: str = "state/current_run_snapshot.json"
+    topic_contribution_dir: str = "state/topic_contributions"
+    topic_index_path: str = "state/topic_index.json"
+    topic_index_manifest_path: str = "state/topic_index_manifest.json"
+    auto_refresh_topic_index: bool = True
+    podcast_id: str = ""
+    podcast_name: str = ""
     cache_schema_version: str = PROCESSED_CACHE_SCHEMA_VERSION
     clustering_reduction: str = "pca"
     grouping_mode: str = "semantic"

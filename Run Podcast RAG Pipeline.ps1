@@ -1,5 +1,5 @@
 param(
-    [ValidateSet("Prompt", "Run", "Debug", "CacheCheck", "SetControl", "CreateStopFile", "ClearStopFile", "CreateCondaEnv")]
+    [ValidateSet("Prompt", "Run", "Debug", "CacheCheck", "SetControl", "CreateStopFile", "ClearStopFile", "CreateCondaEnv", "BuildTopicIndex", "Migrate")]
     [string]$Action = "Prompt",
     [int]$MaxParallelModelRequests
 )
@@ -26,6 +26,7 @@ $RunScript = Join-Path $ScriptRoot "scripts\Run-PodcastRagPipeline.ps1"
 $DebugScript = Join-Path $ScriptRoot "scripts\Test-PodcastRagEnvironment.ps1"
 $CacheScript = Join-Path $ScriptRoot "scripts\Test-ProcessedDataCache.ps1"
 $ControlScript = Join-Path $ScriptRoot "scripts\Set-PodcastRagControl.ps1"
+$MigrationScript = Join-Path $ScriptRoot "scripts\Migrate-LegacyPodcastRagState.ps1"
 
 function Invoke-LauncherScript {
     param(
@@ -78,8 +79,10 @@ if ($Action -eq "Prompt") {
     Write-Host "  5. Create stop-after-current-file request"
     Write-Host "  6. Clear stop-after-current-file request"
     Write-Host "  7. Create or refresh the Conda environment"
+    Write-Host "  8. Build or refresh the topic index"
+    Write-Host "  9. Migrate settings and state from a legacy directory"
     Write-Host "  Q. Quit"
-    $selection = (Read-Host "Enter 1, 2, 3, 4, 5, 6, 7, or Q").Trim()
+    $selection = (Read-Host "Enter 1, 2, 3, 4, 5, 6, 7, 8, 9, or Q").Trim()
 
     switch ($selection.ToUpperInvariant()) {
         "1" { $Action = "Debug" }
@@ -89,6 +92,8 @@ if ($Action -eq "Prompt") {
         "5" { $Action = "CreateStopFile" }
         "6" { $Action = "ClearStopFile" }
         "7" { $Action = "CreateCondaEnv" }
+        "8" { $Action = "BuildTopicIndex" }
+        "9" { $Action = "Migrate" }
         "Q" { Exit-Script 0 }
         default {
             Write-Host "Unrecognized selection. Exiting."
@@ -121,6 +126,12 @@ switch ($Action) {
     }
     "CreateCondaEnv" {
         Invoke-LauncherScript -Path $RunScript -Parameters @{ CreateCondaEnv = $true }
+    }
+    "BuildTopicIndex" {
+        Invoke-LauncherScript -Path $RunScript -Parameters @{ BuildTopicIndex = $true }
+    }
+    "Migrate" {
+        Invoke-LauncherScript -Path $MigrationScript
     }
 }
 
