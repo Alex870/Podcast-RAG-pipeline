@@ -50,6 +50,7 @@ from podcast_rag.text_utils import (
     is_missing_context_response,
     merge_speaker_values,
     new_node_id,
+    normalized_text_key,
     parse_episode_date,
     safe_float,
     short_text,
