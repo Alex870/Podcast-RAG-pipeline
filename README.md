@@ -67,11 +67,15 @@ Before a batch run, verify the local environment:
 .\Run Podcast RAG Pipeline.ps1
 ```
 
+Choose `1` for environment validation.
+
+To start the main batch pipeline:
+
 ```powershell
 .\Run Podcast RAG Pipeline.ps1
 ```
 
-Use the menu to choose between environment validation, the main batch pipeline, processed-cache inspection, live control updates, stop-file management, and Conda environment creation. The main pipeline launcher still creates `podcast_rag_config.json` from the example if needed, applies optional command-line overrides, checks Python dependencies, and runs the pipeline.
+Choose `2` for the main pipeline. The menu also exposes processed-cache inspection, live control updates, stop-file management, and Conda environment creation. The main pipeline launcher still creates `podcast_rag_config.json` from the example if needed, applies optional command-line overrides, checks Python dependencies, and runs the pipeline.
 
 If you prefer to skip the menu, the root launcher also supports direct actions:
 
@@ -85,7 +89,7 @@ If you prefer to skip the menu, the root launcher also supports direct actions:
 .\Run Podcast RAG Pipeline.ps1 -Action CreateCondaEnv
 ```
 
-The underlying scripts remain available in `scripts\` for more specific options.
+The underlying PowerShell scripts remain available in `scripts\` when you want to bypass the menu and call a specific launcher directly.
 
 Useful launcher parameters:
 

@@ -56,6 +56,13 @@ def safe_float(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
 
+def first_present(record: dict[str, Any], keys: list[str]) -> Any:
+    for key in keys:
+        value = record.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
 def format_seconds(seconds: float | None) -> str:
     if seconds is None:
         return "unknown"

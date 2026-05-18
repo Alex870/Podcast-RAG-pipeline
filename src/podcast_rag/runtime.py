@@ -268,6 +268,8 @@ class FakeLLMResponse:
 
 class FakeChain:
     def invoke(self, payload: dict[str, Any]) -> FakeLLMResponse:
+        from podcast_rag.text_utils import deterministic_topic_tags, token_estimate
+
         text = str(payload.get("text", "") or "")
         prompt_tokens = token_estimate(text)
         if text.lstrip().startswith("{") or '"node_id"' in text:
