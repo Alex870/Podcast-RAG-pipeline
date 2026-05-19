@@ -91,6 +91,15 @@ Choose `8` for `Build or refresh the topic index`.
 
 That topic refresh path is intentionally incremental. It scans the existing `processed_data` caches, rebuilds only new or changed per-episode topic contributions, and updates the aggregate `state/topic_index.json` catalog without redoing the expensive transcript summarization work.
 
+If you want the topic refresh to run an extra cache-only cleanup pass over ambiguous topic rows, set `enable_llm_topic_label_curation` to `true` in `podcast_rag_config.json` or run:
+
+```powershell
+python .\podcast_rag_pipeline.py --config .\podcast_rag_config.json --build-topic-index --curate-topic-labels
+```
+
+That pass persists its decisions in `state/topic_label_blacklist.json` and `state/topic_label_whitelist.json`, so future topic-index rebuilds can reuse them without re-asking the model on every run.
+Each rebuild also writes `state/topic_label_curation_report.json`, which shows what got filtered by deterministic rules, what the optional LLM pass explicitly kept or dropped, and which topics survived into the final index.
+
 If you are starting from a fresh pull but already have an older working directory with expensive caches and state, the bootstrap also exposes a migration assistant:
 
 ```powershell
@@ -163,6 +172,8 @@ Processed document caches are stored in `processed_data` using the same file fin
 
 The topic index is intentionally built on top of those processed caches. You can backfill topic coverage for a library that already took days to preprocess by running a cheap cache-only topic refresh instead of rerunning LM Studio summarization for every episode. Per-episode topic contributions are stored in `state/topic_contributions`, the aggregate catalog lives at `state/topic_index.json`, and delta tracking lives at `state/topic_index_manifest.json`.
 
+Topic-label curation lives beside them in `state/topic_label_blacklist.json` and `state/topic_label_whitelist.json`. Deterministic filtering removes obvious junk like stopwords and speaker placeholders first, and the optional LM Studio curation pass can then persist decisions for the harder borderline labels.
+
 The migration assistant is designed around the same principle. It can copy forward `podcast_rag_config.json`, `processed_data`, configured state artifacts, processed-input archives, optional debug outputs, and repo-local input transcripts from a legacy repo without making you rebuild the expensive caches. When the legacy config used absolute paths inside the old repository tree, the migrator rewrites those values to portable repo-relative paths in the new `podcast_rag_config.json`.
 
 To insert or reinsert processed caches into Chroma, use the separate `Chroma DB Import` project.
@@ -222,6 +233,7 @@ python .\podcast_rag_pipeline.py --config .\podcast_rag_config.json
 python .\podcast_rag_pipeline.py --input-dir "C:\path\to\transcripts" --one-file
 python .\podcast_rag_pipeline.py --create-stop-file
 python .\podcast_rag_pipeline.py --config .\podcast_rag_config.json --build-topic-index
+python .\podcast_rag_pipeline.py --config .\podcast_rag_config.json --build-topic-index --curate-topic-labels
 python .\podcast_rag_pipeline.py --inspect-cache
 python .\podcast_rag_pipeline.py --config-doctor
 python .\podcast_rag_pipeline.py --model-eval --model-eval-limit 3

@@ -54,7 +54,12 @@ class PipelineConfig:
     topic_contribution_dir: str = "state/topic_contributions"
     topic_index_path: str = "state/topic_index.json"
     topic_index_manifest_path: str = "state/topic_index_manifest.json"
+    topic_blacklist_path: str = "state/topic_label_blacklist.json"
+    topic_whitelist_path: str = "state/topic_label_whitelist.json"
+    topic_curation_report_path: str = "state/topic_label_curation_report.json"
     auto_refresh_topic_index: bool = True
+    enable_llm_topic_label_curation: bool = False
+    llm_topic_label_curation_limit: int = 250
     podcast_id: str = ""
     podcast_name: str = ""
     cache_schema_version: str = PROCESSED_CACHE_SCHEMA_VERSION

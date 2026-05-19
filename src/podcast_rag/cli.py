@@ -186,7 +186,14 @@ def run_batch(config: PipelineConfig, project_dir: Path, one_file: bool) -> int:
             f"{topic_summary['topic_count']} topics across {topic_summary['episode_count']} episode contribution(s) "
             f"({topic_summary['reused_contributions']} reused, {topic_summary['rebuilt_contributions']} rebuilt)."
         )
+        if topic_summary["llm_curated_keep"] or topic_summary["llm_curated_drop"]:
+            print(
+                "Topic label curation updated: "
+                f"{topic_summary['llm_curated_keep']} kept, {topic_summary['llm_curated_drop']} dropped "
+                f"(whitelist={topic_summary['whitelist_size']}, blacklist={topic_summary['blacklist_size']})."
+            )
         print(f"Topic index path: {topic_summary['topic_index_path']}")
+        print(f"Topic curation report: {topic_summary['topic_curation_report_path']}")
     print("\nBatch run complete.")
     return 0
 
@@ -199,7 +206,14 @@ def build_topic_index(config: PipelineConfig, project_dir: Path) -> int:
         f"{summary['reused_contributions']} reused, {summary['rebuilt_contributions']} rebuilt, "
         f"{summary['removed_contributions']} removed."
     )
+    if summary["llm_curated_keep"] or summary["llm_curated_drop"]:
+        print(
+            "Topic label curation updated: "
+            f"{summary['llm_curated_keep']} kept, {summary['llm_curated_drop']} dropped "
+            f"(whitelist={summary['whitelist_size']}, blacklist={summary['blacklist_size']})."
+        )
     print(f"Topic index path: {summary['topic_index_path']}")
+    print(f"Topic curation report: {summary['topic_curation_report_path']}")
     return 0
 
 def inspect_processed_cache(config: PipelineConfig, project_dir: Path) -> int:
@@ -323,6 +337,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-eval", action="store_true", help="Run the model-evaluation harness on transcript slices.")
     parser.add_argument("--model-eval-limit", type=int, default=3, help="Maximum transcript files to sample for --model-eval.")
     parser.add_argument("--build-topic-index", action="store_true", help="Build or refresh the cache-only topic index from processed_data.")
+    parser.add_argument("--curate-topic-labels", action="store_true", help="Run the optional LM Studio topic-label curation pass during topic-index refresh.")
     parser.add_argument("--fake-llm", action="store_true", help="Use deterministic fake LLM responses for no-LM Studio validation.")
     return parser.parse_args()
 
@@ -350,6 +365,8 @@ def main() -> int:
         config.fake_llm = True
         config.verify_model = False
         config.test_inference = False
+    if args.curate_topic_labels:
+        config.enable_llm_topic_label_curation = True
 
     if args.create_stop_file:
         return create_stop_file(config, project_dir)

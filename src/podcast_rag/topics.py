@@ -1,18 +1,21 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import re
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
+import podcast_rag.runtime as runtime
 from podcast_rag.config import PipelineConfig, config_fingerprint, resolve_path
+from podcast_rag.llm_support import extract_llm_text
 from podcast_rag.state import read_json_file, write_json_file
 from podcast_rag.text_utils import compact_episode_date, episode_sort_key, parse_episode_date, short_text
 
 
-TOPIC_INDEX_SCHEMA_VERSION = "1.0"
-TOPIC_INDEX_LOGIC_VERSION = "2026-05-18"
+TOPIC_INDEX_SCHEMA_VERSION = "1.1"
+TOPIC_INDEX_LOGIC_VERSION = "2026-05-18-curated"
 TOPIC_SOURCE_NODE_TYPES = {"position_card", "cluster_summary", "episode_thesis"}
 TOPIC_STOPWORDS = {
     "a",
@@ -32,9 +35,11 @@ TOPIC_STOPWORDS = {
     "how",
     "issues",
     "like",
+    "only",
     "maybe",
     "more",
     "other",
+    "over",
     "plan",
     "podcast",
     "quest",
@@ -55,9 +60,14 @@ TOPIC_STOPWORDS = {
     "thing",
     "things",
     "this",
+    "than",
     "unknown",
     "very",
     "voodoo",
+    "were",
+    "when",
+    "will",
+    "without",
 }
 TOPIC_ALIASES = {
     "artificial intelligence": "ai",
@@ -70,6 +80,88 @@ TOPIC_ALIASES = {
     "us": "u.s.",
     "u s": "u.s.",
 }
+GENERIC_TOPIC_LABELS = {
+    "acknowledges",
+    "advocate",
+    "advocates",
+    "argue",
+    "argues",
+    "assert",
+    "asserts",
+    "believe",
+    "believes",
+    "calls",
+    "comments",
+    "compares",
+    "criticize",
+    "criticizes",
+    "criticise",
+    "criticises",
+    "describes",
+    "discuss",
+    "discusses",
+    "expresses",
+    "explains",
+    "introduces",
+    "mention",
+    "mentions",
+    "notes",
+    "oppose",
+    "opposes",
+    "question",
+    "questions",
+    "recommends",
+    "responds",
+    "says",
+    "suggests",
+    "support",
+    "supports",
+    "talks",
+    "thinks",
+    "uses",
+    "warns",
+    "despite",
+    "lack",
+    "using",
+    "over",
+    "only",
+    "than",
+    "when",
+    "were",
+    "will",
+    "without",
+}
+META_TOPIC_QUESTION_TEMPLATES = {
+    "advocate": [
+        "What subjects does the host advocate for most strongly?",
+        "What positions does the host push most consistently?",
+        "Where does the host sound most committed or forceful?",
+    ],
+    "criticize": [
+        "What subjects does the host criticize most strongly?",
+        "What recurring objections does the host make?",
+        "Where does the host sound most dismissive or hostile?",
+    ],
+    "question": [
+        "What subjects does the host question or challenge most often?",
+        "What assumptions does the host push back against?",
+        "Where does the host sound most skeptical?",
+    ],
+    "discuss": [
+        "What subjects does the host spend the most time discussing?",
+        "What themes recur most often in the corpus?",
+        "What topics keep resurfacing across episodes?",
+    ],
+    "believe": [
+        "What beliefs does the host return to most often?",
+        "What core assumptions seem to shape the host's worldview?",
+        "What positions appear most consistent across episodes?",
+    ],
+}
+TOPIC_LABEL_NOISE_PATTERNS = (
+    re.compile(r"^speaker\s+\d+$"),
+    re.compile(r"^speaker[_\s-]*[a-z0-9]+$"),
+)
 
 
 def _slug(value: str) -> str:
@@ -113,29 +205,138 @@ def _infer_podcast_id(name: str) -> str:
     return _slug(name)
 
 
-def _normalize_topic_label(label: str) -> tuple[str | None, str | None]:
+def _topic_label_tokens(label: str) -> list[str]:
+    return [
+        token
+        for token in "".join(character.lower() if character.isalnum() else " " for character in label).split()
+        if token
+    ]
+
+
+def _normalize_topic_key(label: str) -> str:
+    raw = re.sub(r"[_/]+", " ", str(label or "")).strip()
+    raw = re.sub(r"\s+", " ", raw)
+    normalized = re.sub(r"[^a-z0-9\s&.-]", " ", raw.lower())
+    normalized = re.sub(r"\s+", " ", normalized).strip(" -.")
+    return TOPIC_ALIASES.get(normalized, normalized)
+
+
+def _topic_label_verdict(label: str) -> tuple[str | None, str | None, str | None]:
     raw = re.sub(r"[_/]+", " ", str(label or "")).strip()
     raw = re.sub(r"\s+", " ", raw)
     if not raw:
-        return None, None
-    normalized = re.sub(r"[^a-z0-9\s&-]", " ", raw.lower())
-    normalized = re.sub(r"\s+", " ", normalized).strip(" -")
-    normalized = TOPIC_ALIASES.get(normalized, normalized)
+        return None, None, "empty"
+    normalized = _normalize_topic_key(raw)
     if not normalized:
-        return None, None
+        return None, None, "empty"
+    if any(pattern.fullmatch(normalized) for pattern in TOPIC_LABEL_NOISE_PATTERNS):
+        return None, None, "speaker_placeholder"
     tokens = [token for token in normalized.split() if token]
     if not tokens:
-        return None, None
+        return None, None, "empty"
     if len(tokens) == 1 and (tokens[0] in TOPIC_STOPWORDS or len(tokens[0]) < 3 and tokens[0] not in {"ai", "uk", "us"}):
-        return None, None
+        return None, None, "stopword_or_too_short"
+    if len(tokens) == 1 and tokens[0] in GENERIC_TOPIC_LABELS:
+        return None, None, "generic_reporting_verb"
+    if len(tokens) == 1 and tokens[0].endswith("s") and tokens[0][:-1] in GENERIC_TOPIC_LABELS:
+        return None, None, "generic_reporting_verb"
+    if len(tokens) <= 2 and any(token == "speaker" for token in tokens):
+        return None, None, "speaker_placeholder"
     if all(token in TOPIC_STOPWORDS for token in tokens):
-        return None, None
+        return None, None, "all_stopwords"
     display = raw if raw.isupper() and len(raw) <= 8 else normalized.title()
     if normalized == "ai":
         display = "AI"
     elif normalized == "u.s.":
         display = "U.S."
+    return normalized, display, None
+
+
+def _topic_meta_question_key(label: str) -> str | None:
+    tokens = _topic_label_tokens(label)
+    if not tokens:
+        return None
+    primary = tokens[0]
+    if primary in {"advocate", "advocates", "support", "supports", "promote", "promotes"}:
+        return "advocate"
+    if primary in {"criticize", "criticizes", "criticise", "criticises", "oppose", "opposes"}:
+        return "criticize"
+    if primary in {"question", "questions", "challenge", "challenges", "doubt", "doubts"}:
+        return "question"
+    if primary in {"discuss", "discusses", "mention", "mentions", "talk", "talks", "describe", "describes"}:
+        return "discuss"
+    if primary in {"believe", "believes", "think", "thinks", "argue", "argues", "assert", "asserts"}:
+        return "believe"
+    return None
+
+
+def _infer_topic_kind(label: str, top_keywords: list[str] | None = None) -> str:
+    tokens = _topic_label_tokens(label)
+    if not tokens:
+        return "subject"
+    if _topic_meta_question_key(label):
+        return "meta_pattern"
+    if len(tokens) == 1 and tokens[0].isupper():
+        return "entity"
+    if any(keyword.lower() in {"policy", "regulation", "law", "tax", "tariff", "fed"} for keyword in (top_keywords or [])):
+        return "policy_theme"
+    return "subject"
+
+
+def _question_templates_for_topic(label: str, topic_kind: str) -> list[str]:
+    meta_key = _topic_meta_question_key(label)
+    if meta_key:
+        return list(META_TOPIC_QUESTION_TEMPLATES[meta_key])
+    if topic_kind == "policy_theme":
+        return [
+            f"What policy positions does the host take on {label}?",
+            f"How has the host's framing of {label} changed over time?",
+            f"What tradeoffs or objections recur in the corpus about {label}?",
+        ]
+    return [
+        f"What are the host's views on {label}?",
+        f"How have the host's views on {label} changed over time?",
+        f"What arguments recur in the corpus about {label}?",
+    ]
+
+
+def _build_query_hints(label: str, aliases: list[str], top_keywords: list[str], topic_kind: str) -> list[str]:
+    hints: list[str] = [label, *aliases[:4], *top_keywords[:6]]
+    meta_key = _topic_meta_question_key(label)
+    if meta_key == "advocate":
+        hints.extend(["what the host advocates for", "what the host supports most strongly"])
+    elif meta_key == "criticize":
+        hints.extend(["what the host criticizes", "what the host objects to most often"])
+    elif meta_key == "question":
+        hints.extend(["what the host questions", "what the host is skeptical about"])
+    elif meta_key == "discuss":
+        hints.extend(["recurring themes", "most discussed subjects"])
+    elif meta_key == "believe":
+        hints.extend(["core beliefs", "recurring assumptions"])
+    elif topic_kind == "policy_theme":
+        hints.extend([f"{label} policy", f"{label} regulation"])
+    seen: set[str] = set()
+    normalized_hints: list[str] = []
+    for hint in hints:
+        compact = re.sub(r"\s+", " ", str(hint or "")).strip()
+        if not compact:
+            continue
+        key = compact.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized_hints.append(compact)
+    return normalized_hints[:12]
+
+
+def _normalize_topic_label(label: str) -> tuple[str | None, str | None]:
+    normalized, display, _reason = _topic_label_verdict(label)
     return normalized, display
+
+
+def _is_obvious_topic_noise(normalized_label: str) -> bool:
+    normalized, _display, _reason = _topic_label_verdict(normalized_label)
+    return normalized is None
 
 
 def _extract_doc_topics(doc: dict[str, Any]) -> list[str]:
@@ -146,7 +347,13 @@ def _extract_doc_topics(doc: dict[str, Any]) -> list[str]:
             if isinstance(value, str):
                 labels.append(value)
     claim = str(metadata.get("claim") or "").strip()
-    if claim:
+    if (
+        claim
+        and not labels
+        and len(claim) <= 80
+        and len(claim.split()) <= 6
+        and not re.search(r"[.!?]", claim)
+    ):
         labels.extend(re.split(r"[;,/]|(?:\s+-\s+)", claim))
     return labels
 
@@ -168,12 +375,8 @@ def _doc_weight(node_type: str) -> float:
     return 1.0
 
 
-def _make_sample_questions(label: str) -> list[str]:
-    return [
-        f"What are the host's views on {label}?",
-        f"How have the host's views on {label} changed over time?",
-        f"What arguments recur in the corpus about {label}?",
-    ]
+def _make_sample_questions(label: str, topic_kind: str) -> list[str]:
+    return _question_templates_for_topic(label, topic_kind)
 
 
 def _days_between(start: str | None, end: str | None) -> int:
@@ -207,6 +410,177 @@ def _topic_state_paths(config: PipelineConfig, project_dir: Path) -> tuple[Path,
     index_path = resolve_path(project_dir, config.topic_index_path)
     manifest_path = resolve_path(project_dir, config.topic_index_manifest_path)
     return contribution_dir, index_path, manifest_path
+
+
+def _topic_curation_paths(config: PipelineConfig, project_dir: Path) -> tuple[Path, Path]:
+    return (
+        resolve_path(project_dir, config.topic_blacklist_path),
+        resolve_path(project_dir, config.topic_whitelist_path),
+    )
+
+
+def _topic_curation_report_path(config: PipelineConfig, project_dir: Path) -> Path:
+    return resolve_path(project_dir, config.topic_curation_report_path)
+
+
+def _load_label_set(path: Path) -> set[str]:
+    if not path.exists():
+        return set()
+    payload = read_json_file(path)
+    if isinstance(payload, dict):
+        values = payload.get("labels") or payload.get("topics") or []
+    else:
+        values = payload
+    labels: set[str] = set()
+    if not isinstance(values, list):
+        return labels
+    for value in values:
+        normalized = _normalize_topic_key(str(value or ""))
+        if normalized:
+            labels.add(normalized)
+    return labels
+
+
+def _write_label_set(path: Path, labels: set[str]) -> None:
+    write_json_file(
+        path,
+        {
+            "schema_version": "1.0",
+            "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "labels": sorted(labels),
+        },
+    )
+
+
+def _load_topic_curation(config: PipelineConfig, project_dir: Path) -> tuple[set[str], set[str]]:
+    blacklist_path, whitelist_path = _topic_curation_paths(config, project_dir)
+    return _load_label_set(blacklist_path), _load_label_set(whitelist_path)
+
+
+def _topic_is_curated_out(normalized_label: str, blacklist: set[str], whitelist: set[str]) -> bool:
+    if normalized_label in whitelist:
+        return False
+    return normalized_label in blacklist
+
+
+def _collect_topic_review_candidates(
+    contributions: list[dict[str, Any]],
+    blacklist: set[str],
+    whitelist: set[str],
+) -> dict[str, dict[str, Any]]:
+    candidates: dict[str, dict[str, Any]] = {}
+    for contribution in contributions:
+        episode_key = str(contribution.get("canonical_episode_key") or contribution.get("source_fingerprint") or "")
+        for topic in contribution.get("topics") or []:
+            normalized = str(topic.get("normalized_label") or "").strip()
+            if not normalized or normalized in blacklist or normalized in whitelist:
+                continue
+            entry = candidates.setdefault(
+                normalized,
+                {
+                    "label": str(topic.get("label") or normalized.title()),
+                    "topic_kind": str(topic.get("topic_kind") or "subject"),
+                    "aliases": Counter(),
+                    "episode_keys": set(),
+                    "document_count": 0,
+                    "keyword_counts": Counter(),
+                },
+            )
+            entry["aliases"].update(topic.get("aliases") or [])
+            entry["episode_keys"].add(episode_key)
+            entry["document_count"] += int(topic.get("document_count") or 0)
+            entry["keyword_counts"].update(topic.get("top_keywords") or [])
+    return candidates
+
+
+def _needs_llm_topic_review(candidate: dict[str, Any]) -> bool:
+    label = str(candidate.get("label") or "")
+    tokens = _topic_label_tokens(label)
+    if not tokens:
+        return False
+    if any(pattern.fullmatch(_normalize_topic_key(label)) for pattern in TOPIC_LABEL_NOISE_PATTERNS):
+        return False
+    if len(tokens) == 1:
+        return True
+    if candidate.get("topic_kind") == "meta_pattern":
+        return True
+    if len(tokens) == 2 and all(len(token) <= 5 for token in tokens):
+        return True
+    return False
+
+
+def _extract_json_object(text: str) -> dict[str, Any]:
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end < start:
+        raise ValueError("No JSON object found in topic curation response.")
+    return json.loads(text[start : end + 1])
+
+
+def _curate_topic_labels_with_llm(
+    config: PipelineConfig,
+    candidates: dict[str, dict[str, Any]],
+) -> tuple[set[str], set[str]]:
+    if not config.enable_llm_topic_label_curation or config.fake_llm:
+        return set(), set()
+    reviewable = [
+        {
+            "normalized_label": normalized,
+            "label": candidate["label"],
+            "topic_kind": candidate["topic_kind"],
+            "episode_count": len(candidate["episode_keys"]),
+            "document_count": candidate["document_count"],
+            "aliases": [alias for alias, _count in candidate["aliases"].most_common(4)],
+            "top_keywords": [keyword for keyword, _count in candidate["keyword_counts"].most_common(6)],
+        }
+        for normalized, candidate in candidates.items()
+        if _needs_llm_topic_review(candidate)
+    ]
+    if not reviewable:
+        return set(), set()
+
+    runtime.load_runtime_deps()
+    client = runtime.OpenAI(base_url=config.lm_studio_base_url, api_key=config.lm_studio_api_key)
+    keep: set[str] = set()
+    drop: set[str] = set()
+    limit = max(0, int(config.llm_topic_label_curation_limit or 0))
+    batches = reviewable[:limit] if limit else reviewable
+
+    for offset in range(0, len(batches), 40):
+        batch = batches[offset : offset + 40]
+        response = client.chat.completions.create(
+            model=config.lm_studio_model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You curate candidate podcast topic labels for a browsing UI. "
+                        "Keep only labels that are meaningful browseable subjects, entities, policy themes, "
+                        "or stable rhetorical/meta patterns. Drop function words, grammar leftovers, generic verbs, "
+                        "speaker placeholders, and vague fragments that would make bad topic rows. "
+                        "Return JSON only with keys keep and drop, each containing normalized_label values."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps({"topics": batch}, ensure_ascii=True),
+                },
+            ],
+            max_tokens=800,
+        )
+        message = response.choices[0].message if getattr(response, "choices", None) else ""
+        text = extract_llm_text(message) or getattr(message, "content", "") or ""
+        payload = _extract_json_object(str(text))
+        for value in payload.get("keep") or []:
+            normalized = _normalize_topic_key(str(value or ""))
+            if normalized:
+                keep.add(normalized)
+        for value in payload.get("drop") or []:
+            normalized = _normalize_topic_key(str(value or ""))
+            if normalized:
+                drop.add(normalized)
+    drop.difference_update(keep)
+    return keep, drop
 
 
 def _load_manifest(path: Path) -> dict[str, Any]:
@@ -265,6 +639,7 @@ def build_episode_topic_contribution(config: PipelineConfig, cache_path: Path, p
     episode_title = canonical_episode
 
     topic_map: dict[str, dict[str, Any]] = {}
+    filtered_topic_labels: list[dict[str, Any]] = []
     for doc in docs:
         metadata = dict(doc.get("metadata") or {})
         node_type = str(metadata.get("node_type") or "unknown")
@@ -274,8 +649,17 @@ def build_episode_topic_contribution(config: PipelineConfig, cache_path: Path, p
         if not raw_topics:
             continue
         for raw_topic in raw_topics:
-            normalized, display = _normalize_topic_label(raw_topic)
+            normalized, display, rejection_reason = _topic_label_verdict(raw_topic)
             if not normalized or not display:
+                filtered_topic_labels.append(
+                    {
+                        "raw_label": str(raw_topic or ""),
+                        "normalized_label": _normalize_topic_key(str(raw_topic or "")),
+                        "reason": rejection_reason or "filtered",
+                        "node_type": node_type,
+                        "stable_document_id": str(metadata.get("stable_document_id") or ""),
+                    }
+                )
                 continue
             topic = topic_map.setdefault(
                 normalized,
@@ -329,6 +713,7 @@ def build_episode_topic_contribution(config: PipelineConfig, cache_path: Path, p
                 "normalized_label": normalized,
                 "label": label,
                 "aliases": aliases,
+                "topic_kind": _infer_topic_kind(label, [keyword for keyword, _count in topic["keyword_counts"].most_common(6)]),
                 "score": round(float(topic["score"]), 4),
                 "document_count": int(topic["document_count"]),
                 "position_count": int(topic["node_type_counts"].get("position_card", 0)),
@@ -357,10 +742,19 @@ def build_episode_topic_contribution(config: PipelineConfig, cache_path: Path, p
         "episode_sort_key": episode_sort_key(episode_date) or 0,
         "topic_count": len(topics),
         "topics": topics,
+        "filtered_topic_labels": filtered_topic_labels,
     }
 
 
-def _aggregate_topic_index(config: PipelineConfig, project_dir: Path, contributions: list[dict[str, Any]]) -> dict[str, Any]:
+def _aggregate_topic_index(
+    config: PipelineConfig,
+    project_dir: Path,
+    contributions: list[dict[str, Any]],
+    blacklist: set[str] | None = None,
+    whitelist: set[str] | None = None,
+) -> dict[str, Any]:
+    blacklist = blacklist or set()
+    whitelist = whitelist or set()
     bucket_map: dict[tuple[str, str], dict[str, Any]] = {}
     episode_counts_by_podcast: Counter[str] = Counter()
     podcast_names: dict[str, str] = {}
@@ -371,7 +765,14 @@ def _aggregate_topic_index(config: PipelineConfig, project_dir: Path, contributi
         podcast_names[podcast_id] = podcast_name
         episode_counts_by_podcast[podcast_id] += 1
         for topic in contribution.get("topics") or []:
-            key = (podcast_id, str(topic.get("normalized_label") or topic.get("label") or ""))
+            normalized_label = str(topic.get("normalized_label") or topic.get("label") or "")
+            if (
+                not normalized_label
+                or _is_obvious_topic_noise(normalized_label)
+                or _topic_is_curated_out(normalized_label, blacklist, whitelist)
+            ):
+                continue
+            key = (podcast_id, normalized_label)
             bucket = bucket_map.setdefault(
                 key,
                 {
@@ -422,6 +823,7 @@ def _aggregate_topic_index(config: PipelineConfig, project_dir: Path, contributi
     for (_podcast_id, _normalized_label), bucket in bucket_map.items():
         aliases = [label for label, _count in bucket["aliases"].most_common()]
         label = aliases[0] if aliases else bucket["topic_key"].replace("-", " ").title()
+        topic_kind = _infer_topic_kind(label, [keyword for keyword, _count in bucket["keyword_counts"].most_common(8)])
         episode_count = len(bucket["episode_keys"])
         timespan_days = _days_between(bucket["first_episode_date"], bucket["latest_episode_date"])
         depth_score = (
@@ -445,6 +847,7 @@ def _aggregate_topic_index(config: PipelineConfig, project_dir: Path, contributi
             "podcast_name": bucket["podcast_name"],
             "topic_key": bucket["topic_key"],
             "label": label,
+            "topic_kind": topic_kind,
             "aliases": aliases,
             "depth_score": round(depth_score, 4),
             "depth_label": _depth_label(depth_score),
@@ -462,7 +865,14 @@ def _aggregate_topic_index(config: PipelineConfig, project_dir: Path, contributi
             "representative_excerpt": earliest.get("excerpt") or latest.get("excerpt") or "",
             "earliest_evidence": earliest,
             "latest_evidence": latest,
-            "sample_questions": _make_sample_questions(label),
+            "sample_questions": _make_sample_questions(label, topic_kind),
+            "question_templates": _question_templates_for_topic(label, topic_kind),
+            "query_hints": _build_query_hints(
+                label,
+                aliases,
+                [keyword for keyword, _count in bucket["keyword_counts"].most_common(8)],
+                topic_kind,
+            ),
             "related_doc_ids": [item.get("stable_document_id") for item in evidence if item.get("stable_document_id")][:12],
             "evidence": evidence[:12],
         }
@@ -510,6 +920,10 @@ def refresh_topic_index(config: PipelineConfig, project_dir: Path) -> dict[str, 
     reused = 0
     rebuilt = 0
     removed = 0
+    llm_curated_keep = 0
+    llm_curated_drop = 0
+    deterministic_filtered_counts: Counter[str] = Counter()
+    deterministic_filtered_examples: dict[str, list[dict[str, Any]]] = defaultdict(list)
 
     existing_episode_keys = set(manifest.get("episodes", {}))
     selected_episode_keys = set(selected)
@@ -536,6 +950,20 @@ def refresh_topic_index(config: PipelineConfig, project_dir: Path) -> dict[str, 
             rebuilt += 1
 
         contributions.append(contribution)
+        for filtered in contribution.get("filtered_topic_labels") or []:
+            normalized_label = str(filtered.get("normalized_label") or "").strip()
+            if not normalized_label:
+                continue
+            deterministic_filtered_counts[normalized_label] += 1
+            if len(deterministic_filtered_examples[normalized_label]) < 3:
+                deterministic_filtered_examples[normalized_label].append(
+                    {
+                        "raw_label": str(filtered.get("raw_label") or ""),
+                        "reason": str(filtered.get("reason") or "filtered"),
+                        "episode_key": episode_key,
+                        "node_type": str(filtered.get("node_type") or ""),
+                    }
+                )
         next_manifest["episodes"][episode_key] = {
             "cache_path": str(cache_path),
             "cache_signature": cache_signature,
@@ -552,7 +980,60 @@ def refresh_topic_index(config: PipelineConfig, project_dir: Path) -> dict[str, 
             stale_path.unlink()
             removed += 1
 
-    topic_index = _aggregate_topic_index(config, project_dir, contributions)
+    blacklist_path, whitelist_path = _topic_curation_paths(config, project_dir)
+    blacklist, whitelist = _load_topic_curation(config, project_dir)
+    try:
+        keep_labels, drop_labels = _curate_topic_labels_with_llm(
+            config,
+            _collect_topic_review_candidates(contributions, blacklist, whitelist),
+        )
+    except Exception as exc:
+        print(f"Topic label curation warning: {type(exc).__name__}: {exc}")
+        keep_labels, drop_labels = set(), set()
+    if keep_labels or drop_labels or not blacklist_path.exists() or not whitelist_path.exists():
+        whitelist.update(keep_labels)
+        blacklist.update(drop_labels)
+        blacklist.difference_update(whitelist)
+        _write_label_set(blacklist_path, blacklist)
+        _write_label_set(whitelist_path, whitelist)
+        llm_curated_keep = len(keep_labels)
+        llm_curated_drop = len(drop_labels)
+
+    topic_index = _aggregate_topic_index(config, project_dir, contributions, blacklist=blacklist, whitelist=whitelist)
+    report_path = _topic_curation_report_path(config, project_dir)
+    write_json_file(
+        report_path,
+        {
+            "schema_version": "1.0",
+            "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "logic_version": TOPIC_INDEX_LOGIC_VERSION,
+            "config_fingerprint": config_fingerprint(config),
+            "blacklist_path": str(blacklist_path),
+            "whitelist_path": str(whitelist_path),
+            "deterministic_filtered": [
+                {
+                    "normalized_label": label,
+                    "count": int(deterministic_filtered_counts[label]),
+                    "examples": deterministic_filtered_examples[label],
+                }
+                for label, _count in deterministic_filtered_counts.most_common()
+            ],
+            "llm_whitelisted": sorted(keep_labels),
+            "llm_blacklisted": sorted(drop_labels),
+            "persisted_whitelist": sorted(whitelist),
+            "persisted_blacklist": sorted(blacklist),
+            "surviving_topics": [
+                {
+                    "topic_key": topic.get("topic_key"),
+                    "label": topic.get("label"),
+                    "topic_kind": topic.get("topic_kind"),
+                    "episode_count": topic.get("episode_count"),
+                    "depth_label": topic.get("depth_label"),
+                }
+                for topic in topic_index.get("topics") or []
+            ],
+        },
+    )
     write_json_file(index_path, topic_index)
     write_json_file(manifest_path, next_manifest)
     return {
@@ -563,4 +1044,9 @@ def refresh_topic_index(config: PipelineConfig, project_dir: Path) -> dict[str, 
         "reused_contributions": reused,
         "rebuilt_contributions": rebuilt,
         "removed_contributions": removed,
+        "blacklist_size": len(blacklist),
+        "whitelist_size": len(whitelist),
+        "llm_curated_keep": llm_curated_keep,
+        "llm_curated_drop": llm_curated_drop,
+        "topic_curation_report_path": str(report_path),
     }
