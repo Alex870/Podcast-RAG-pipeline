@@ -61,6 +61,20 @@ def serialize_document(
             str(metadata.get("node_id") or ""),
             page_content,
         )
+    if "source_node_fingerprint" not in metadata:
+        import hashlib
+
+        source_node = {
+            "source_fingerprint": source_fingerprint,
+            "node_id": metadata.get("node_id"),
+            "node_type": metadata.get("node_type"),
+            "page_content": page_content,
+            "source_segment_ids": metadata.get("source_segment_ids") or [],
+            "source_spans": metadata.get("source_spans") or [],
+        }
+        metadata["source_node_fingerprint"] = hashlib.sha256(
+            json.dumps(source_node, sort_keys=True, separators=(",", ":"), ensure_ascii=True, default=str).encode("utf-8")
+        ).hexdigest()
     payload = {"page_content": page_content, "metadata": metadata}
     if embedding_text is not None:
         payload["embedding_text"] = str(embedding_text)
@@ -83,7 +97,7 @@ def normalize_document_item(item: Any) -> dict[str, Any]:
     }
 
 
-def validate_processed_documents(items: list[Any]) -> ValidationResult:
+def validate_processed_documents(items: list[Any], require_provenance: bool = False) -> ValidationResult:
     errors: list[str] = []
     warnings: list[str] = []
     normalized = [normalize_document_item(item) for item in items]
@@ -122,6 +136,16 @@ def validate_processed_documents(items: list[Any]) -> ValidationResult:
             if not metadata.get("child_ids"):
                 warnings.append(f"{label} has no evidence child_ids")
 
+        if require_provenance:
+            if node_type == "leaf_chunk" and not (
+                metadata.get("source_segment_ids")
+                or metadata.get("source_spans")
+                or (metadata.get("start_time") is not None and metadata.get("end_time") is not None)
+            ):
+                errors.append(f"{label} has no source segment IDs or exact source span/timestamps")
+            if node_type != "leaf_chunk" and not metadata.get("child_ids"):
+                errors.append(f"{label} has no child evidence links")
+
         for child_id in metadata.get("child_ids") or []:
             if isinstance(child_id, str) and child_id:
                 child_refs.append((node_id, child_id))
@@ -134,6 +158,41 @@ def validate_processed_documents(items: list[Any]) -> ValidationResult:
     for parent_id, child_id in child_refs:
         if child_id not in node_ids:
             errors.append(f"{parent_id} references missing child_id {child_id}")
+
+    if require_provenance:
+        by_id = {str(item["metadata"].get("node_id")): item["metadata"] for item in normalized}
+        for node_id, metadata in by_id.items():
+            parent_id = metadata.get("parent_id")
+            if parent_id and parent_id not in by_id:
+                errors.append(f"{node_id} references missing parent_id {parent_id}")
+            for child_id in metadata.get("child_ids") or []:
+                if (
+                    metadata.get("node_type") != "position_card"
+                    and child_id in by_id
+                    and by_id[child_id].get("parent_id") != node_id
+                ):
+                    errors.append(f"{node_id} child {child_id} has inconsistent parent_id")
+
+            if metadata.get("node_type") == "leaf_chunk":
+                continue
+            frontier = list(metadata.get("child_ids") or [])
+            visited: set[str] = set()
+            reaches_leaf = False
+            while frontier:
+                child_id = str(frontier.pop())
+                if child_id in visited:
+                    errors.append(f"{node_id} evidence graph contains a cycle at {child_id}")
+                    break
+                visited.add(child_id)
+                child = by_id.get(child_id)
+                if child is None:
+                    break
+                if child.get("node_type") == "leaf_chunk":
+                    reaches_leaf = True
+                    continue
+                frontier.extend(child.get("child_ids") or [])
+            if not reaches_leaf:
+                errors.append(f"{node_id} does not close to a leaf evidence node")
 
     return ValidationResult(valid=not errors, errors=errors, warnings=warnings, counts=dict(counts))
 
@@ -156,7 +215,7 @@ def validate_processed_cache(payload: Any) -> ValidationResult:
         errors.append("cache documents must be an array")
         return ValidationResult(False, errors, warnings, {})
 
-    document_result = validate_processed_documents(documents)
+    document_result = validate_processed_documents(documents, require_provenance=schema_version == "2.1")
     errors.extend(document_result.errors)
     warnings.extend(document_result.warnings)
 

@@ -48,6 +48,18 @@ class RepresentationTests(unittest.TestCase):
         enriched = serialize_document(doc, "source", "Context\nStable source text", "Stable source text TFM")
         self.assertEqual(plain["metadata"]["stable_document_id"], enriched["metadata"]["stable_document_id"])
 
+    def test_representation_fingerprints_are_source_and_builder_specific(self):
+        builder = RepresentationBuilder()
+        first = builder.fingerprints("source-a", self.metadata, "Stable source text")
+        second = builder.fingerprints("source-a", self.metadata, "Stable source text")
+        changed_source = builder.fingerprints("source-b", self.metadata, "Stable source text")
+        changed_mode = RepresentationBuilder(embedding_text_mode="context-header-v1").fingerprints(
+            "source-a", self.metadata, "Stable source text"
+        )
+        self.assertEqual(first, second)
+        self.assertNotEqual(first["dense_text"], changed_source["dense_text"])
+        self.assertNotEqual(first["dense_text"], changed_mode["dense_text"])
+
 
 if __name__ == "__main__":
     unittest.main()

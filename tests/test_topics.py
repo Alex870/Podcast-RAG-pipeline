@@ -1,6 +1,6 @@
 import json
 import shutil
-import uuid
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -68,9 +68,7 @@ def _write_label_file(path: Path, labels: list[str]) -> None:
 
 
 def _make_temp_root() -> Path:
-    root = Path(__file__).resolve().parents[1] / ".test_tmp" / f"topic-tests-{uuid.uuid4().hex}"
-    root.mkdir(parents=True, exist_ok=True)
-    return root
+    return Path(tempfile.mkdtemp(prefix="topic-tests-"))
 
 
 class TopicIndexTests(unittest.TestCase):

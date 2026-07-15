@@ -26,6 +26,8 @@ from podcast_rag.state import (
     write_run_reports,
     write_run_snapshot,
     should_skip_file,
+    backfill_cache_file,
+    export_dense_baseline,
 )
 from podcast_rag.text_utils import (
     deterministic_topic_tags,
@@ -339,6 +341,29 @@ def evaluate_retrieval(
     print(f"Markdown report: {report['markdown_report_path']}")
     return 0
 
+
+def backfill_representations(config: PipelineConfig, project_dir: Path, cache_path: str | None = None) -> int:
+    processed_data_dir = resolve_path(project_dir, config.processed_data_dir)
+    paths = [resolve_path(project_dir, cache_path)] if cache_path else sorted(processed_data_dir.glob("*.processed_documents.json"))
+    if not paths:
+        print(f"No processed caches found in {processed_data_dir}")
+        return 0
+    for path in paths:
+        result = backfill_cache_file(path, config)
+        print(f"Backfilled {result['document_count']} document(s): {result['cache_path']}")
+    return 0
+
+
+def export_dense_retrieval_baseline(config: PipelineConfig, project_dir: Path, output_path: str | None) -> int:
+    processed_data_dir = resolve_path(project_dir, config.processed_data_dir)
+    destination = resolve_path(project_dir, output_path or "evaluation/exports/page-content-v1-baseline.json")
+    result = export_dense_baseline(processed_data_dir, destination)
+    print(
+        f"Dense baseline exported: {result['document_count']} document(s) from "
+        f"{result['cache_count']} cache(s) to {result['output_path']}"
+    )
+    return 0
+
 def create_stop_file(config: PipelineConfig, project_dir: Path) -> int:
     stop_file = resolve_path(project_dir, config.stop_file)
     stop_file.parent.mkdir(parents=True, exist_ok=True)
@@ -364,6 +389,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--retrieval-results", help="Path to captured ranked retrieval results JSON for --retrieval-eval.")
     parser.add_argument("--query-set", help="Override the configured retrieval evaluation query-set JSONL path.")
     parser.add_argument("--evaluation-output-dir", help="Override the retrieval evaluation report directory.")
+    parser.add_argument("--backfill-representations", action="store_true", help="Backfill deterministic provenance and representations in existing caches without LLM work.")
+    parser.add_argument("--cache-path", help="Backfill one processed cache instead of all caches.")
+    parser.add_argument("--export-dense-baseline", action="store_true", help="Export page-content-v1 dense documents for downstream evaluation.")
+    parser.add_argument("--export-output", help="Output path for --export-dense-baseline.")
     parser.add_argument("--build-topic-index", action="store_true", help="Build or refresh the cache-only topic index from processed_data.")
     parser.add_argument("--curate-topic-labels", action="store_true", help="Run the optional LM Studio topic-label curation pass during topic-index refresh.")
     parser.add_argument("--fake-llm", action="store_true", help="Use deterministic fake LLM responses for no-LM Studio validation.")
@@ -414,6 +443,10 @@ def main() -> int:
             query_set=args.query_set,
             output_dir=args.evaluation_output_dir,
         )
+    if args.backfill_representations:
+        return backfill_representations(config, project_dir, args.cache_path)
+    if args.export_dense_baseline:
+        return export_dense_retrieval_baseline(config, project_dir, args.export_output)
     if args.build_topic_index:
         return build_topic_index(config, project_dir)
 

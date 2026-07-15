@@ -112,3 +112,24 @@ def config_fingerprint(config: PipelineConfig) -> str:
     """Create a stable hash of effective config values for cache provenance."""
     payload = json.dumps({field.name: getattr(config, field.name) for field in fields(config)}, sort_keys=True, default=str)
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+
+def generation_config_fingerprint(config: PipelineConfig) -> str:
+    """Fingerprint settings that can invalidate LLM-generated hierarchy/position nodes."""
+    representation_only = {
+        "embedding_text_mode",
+        "lexical_text_mode",
+        "contextual_header_max_chars",
+        "retrieval_evaluation_query_set",
+        "retrieval_evaluation_output_dir",
+    }
+    payload = json.dumps(
+        {
+            field.name: getattr(config, field.name)
+            for field in fields(config)
+            if field.name not in representation_only
+        },
+        sort_keys=True,
+        default=str,
+    )
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()

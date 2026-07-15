@@ -1,0 +1,17 @@
+{
+  "run_id": "ci-dense-baseline-v1",
+  "strategy_id": "page-content-v1",
+  "manifest": {"representation": "page-content-v1", "embedding_model": "synthetic-ci"},
+  "queries": [
+    {
+      "query_id": "ci-fact-001",
+      "latency_ms": 12.5,
+      "results": [
+        {"document_id": "ci-noise", "metadata": {"node_type": "leaf_chunk", "speaker": "Guest", "episode_id": "ep-noise", "episode_date": "2025-01-01"}},
+        {"document_id": "ci-leaf-a", "metadata": {"node_type": "leaf_chunk", "speaker": "TFM", "episode_id": "ep-a", "episode_date": "2026-01-02"}},
+        {"document_id": "ci-position-a", "metadata": {"node_type": "position_card", "speaker": "TFM", "episode_id": "ep-a", "episode_date": "2026-01-02"}},
+        {"document_id": "ci-position-a", "metadata": {"node_type": "position_card", "speaker": "TFM", "episode_id": "ep-a", "episode_date": "2026-01-02"}}
+      ]
+    }
+  ]
+}

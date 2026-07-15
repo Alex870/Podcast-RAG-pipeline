@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import re
 import time
@@ -10,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import podcast_rag.runtime as runtime
-from podcast_rag.config import PipelineConfig, config_fingerprint, resolve_path
+from podcast_rag.config import PipelineConfig, config_fingerprint, generation_config_fingerprint, resolve_path
 from podcast_rag.llm_support import extract_llm_text, extract_token_usage, serialize_llm_response
 from podcast_rag.runtime import (
     PIPELINE_VERSION,
@@ -330,6 +331,11 @@ class PodcastRagPipeline:
         metadata["episode_title"] = metadata.get("episode_title") or episode_title_from_source(source)
         metadata["source_type"] = metadata.get("source_type") or "json_transcript"
         metadata["segment_index"] = metadata.get("segment_index", index)
+        metadata["source_segment_id"] = str(
+            metadata.get("source_segment_id")
+            or metadata.get("segment_id")
+            or f"{metadata['episode_id']}:segment:{metadata['segment_index']}"
+        )
         metadata["start_time"] = safe_float(metadata.get("start_time"))
         metadata["end_time"] = safe_float(metadata.get("end_time"))
         metadata["speaker"] = metadata.get("speaker")
@@ -337,6 +343,35 @@ class PodcastRagPipeline:
         metadata["episode_date_compact"] = metadata.get("episode_date_compact") or compact_episode_date(metadata.get("episode_date"))
         metadata["episode_sort_key"] = metadata.get("episode_sort_key") or episode_sort_key(metadata.get("episode_date"))
         return Document(page_content=doc.page_content.strip(), metadata=metadata)
+
+    def evidence_metadata(self, docs: list[Document]) -> dict[str, Any]:
+        segment_ids = []
+        spans = []
+        seen_ids = set()
+        seen_spans = set()
+        for doc in docs:
+            metadata = doc.metadata
+            ids = metadata.get("source_segment_ids") or ([metadata.get("source_segment_id")] if metadata.get("source_segment_id") else [])
+            for segment_id in ids:
+                if segment_id and segment_id not in seen_ids:
+                    seen_ids.add(segment_id)
+                    segment_ids.append(str(segment_id))
+            if metadata.get("source_spans"):
+                source_spans = metadata["source_spans"]
+            elif metadata.get("start_time") is not None and metadata.get("end_time") is not None:
+                source_spans = [{
+                    "start_time": metadata["start_time"],
+                    "end_time": metadata["end_time"],
+                    "segment_ids": [str(segment_id) for segment_id in ids if segment_id],
+                }]
+            else:
+                source_spans = []
+            for span in source_spans:
+                key = json.dumps(span, sort_keys=True, ensure_ascii=True, default=str)
+                if key not in seen_spans:
+                    seen_spans.add(key)
+                    spans.append(span)
+        return {"source_segment_ids": segment_ids, "source_spans": spans}
 
     def build_leaf_chunks(self, docs: list[Document], source: str) -> list[Document]:
         normalized = [self.normalize_doc(doc, source, idx) for idx, doc in enumerate(docs)]
@@ -407,6 +442,7 @@ class PodcastRagPipeline:
                 "speaker": speaker,
                 "speaker_scope": scope,
                 "speakers": speakers,
+                **self.evidence_metadata(docs),
             },
         )
 
@@ -656,6 +692,7 @@ class PodcastRagPipeline:
                 "summary_generation": "fallback" if summary.lstrip().startswith("- Fallback") else "model",
                 "fallback_generated": summary.lstrip().startswith("- Fallback"),
                 "compression_ratio": round(len(summary) / max(1, sum(len(doc.page_content or "") for doc in docs)), 4),
+                **self.evidence_metadata(docs),
             },
         )
 
@@ -712,6 +749,7 @@ class PodcastRagPipeline:
                         raise PipelineInterrupted("Stop requested after in-flight model requests completed.")
 
             unique_summaries = []
+            all_summaries = []
             seen_summary_texts = []
             for summary_doc in summaries:
                 key = normalized_text_key(summary_doc.page_content)
@@ -722,11 +760,13 @@ class PodcastRagPipeline:
                 )
                 if key and duplicate:
                     summary_doc.metadata["duplicate_summary"] = True
+                    all_summaries.append(summary_doc)
                     continue
                 seen_summary_texts.append((key, summary_doc.page_content))
                 summary_doc.metadata["duplicate_summary"] = False
                 unique_summaries.append(summary_doc)
-            all_nodes.extend(summaries)
+                all_summaries.append(summary_doc)
+            all_nodes.extend(all_summaries)
             if len(unique_summaries) != len(summaries):
                 print(f"  removed {len(summaries) - len(unique_summaries)} duplicate L{level} summary node(s) from rollup")
             summaries = unique_summaries
@@ -771,6 +811,7 @@ class PodcastRagPipeline:
                 "topic_tags": deterministic_topic_tags(thesis_text, self.config.deterministic_topic_count),
                 "summary_generation": "model" if self.config.episode_thesis_reduce_with_llm else "deterministic",
                 "fallback_generated": False,
+                **self.evidence_metadata(leaf_chunks),
             },
         )
 
@@ -894,10 +935,24 @@ class PodcastRagPipeline:
             episode_date = parse_episode_date(position.get("episode_date")) or thesis_meta.get("episode_date")
             position_speaker = coerce_text(position.get("speaker")) or "unknown"
             if position_speaker.lower() in {"unknown", "unclear", "ambiguous", "multiple", "mixed"}:
+                self.write_llm_debug_event(
+                    label="position extraction",
+                    event="position_quarantined_ambiguous_speaker",
+                    prompt_text="",
+                    response_text=json.dumps(position, ensure_ascii=True, default=str),
+                    error="Structured position did not contain an attributable single speaker.",
+                )
                 continue
             if not claim:
                 continue
             if not evidence_docs:
+                self.write_llm_debug_event(
+                    label="position extraction",
+                    event="position_quarantined_orphaned_evidence",
+                    prompt_text="",
+                    response_text=json.dumps(position, ensure_ascii=True, default=str),
+                    error="Structured position referenced no known evidence node.",
+                )
                 continue
             evidence_excerpt = " ".join(clip_text(doc.page_content, self.config.position_quote_excerpt_chars) for doc in evidence_docs[:3])
             position_key = (
@@ -963,6 +1018,7 @@ class PodcastRagPipeline:
                         "start_time": evidence_start,
                         "end_time": evidence_end,
                         "speakers": [position_speaker] if position_speaker != "unknown" else [],
+                        **self.evidence_metadata(evidence_docs),
                     },
                 )
             )
@@ -987,7 +1043,7 @@ class PodcastRagPipeline:
             if len(bad) > 10:
                 preview += f"; and {len(bad) - 10} more"
             raise ValueError(f"{label} produced invalid documents: {preview}")
-        result = validate_processed_documents(docs)
+        result = validate_processed_documents(docs, require_provenance=True)
         result.raise_for_errors(label)
         for warning in result.warnings[:5]:
             print(f"  cache validation warning: {warning}")
@@ -1023,9 +1079,11 @@ class PodcastRagPipeline:
             "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
             "source_path": str(source_path),
             "source_fingerprint": fingerprint,
+            "source_transcript_hash": hashlib.sha256(source_path.read_bytes()).hexdigest(),
             "source_schema_version": source_schema_version(source_path),
             "stable_source_id": stable_episode_id(fingerprint),
             "config_fingerprint": config_fingerprint(self.config),
+            "generation_config_fingerprint": generation_config_fingerprint(self.config),
             "model": self.config.lm_studio_model,
             "embedding_model": self.config.embedding_model,
             "representations": representation_builder.manifest(),
@@ -1043,8 +1101,10 @@ class PodcastRagPipeline:
                 "pipeline_version": PIPELINE_VERSION,
                 "prompt_version": PROMPT_VERSION,
                 "source_fingerprint": fingerprint,
+                "source_transcript_hash": hashlib.sha256(source_path.read_bytes()).hexdigest(),
                 "model": self.config.lm_studio_model,
                 "config_fingerprint": config_fingerprint(self.config),
+                "generation_config_fingerprint": generation_config_fingerprint(self.config),
                 "representations": representation_builder.manifest(),
             },
             "document_count": len(docs),

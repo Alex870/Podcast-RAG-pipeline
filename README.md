@@ -68,6 +68,8 @@ The expected captured-results shape is shown in `examples/retrieval_results.exam
 
 The pipeline now emits the fields needed for downstream contextual and lexical retrieval, but existing versions of Chroma DB Import and PodCast Chat must be upgraded separately before they use those fields. Until then, their established `page_content` dense-vector workflow remains unchanged.
 
+For an additive upgrade of existing processed caches, use `--backfill-representations`; it reuses valid hierarchy and position outputs and writes deterministic provenance/representation fingerprints without calling the LLM. Use `--export-dense-baseline` to emit a downstream-ready `page-content-v1` export containing stable IDs, dense text, citation text, metadata, and source-cache manifests.
+
 New configuration fields:
 
 | Field | Default | Purpose |

@@ -26,6 +26,11 @@ class QueryRecord:
     def judged(self) -> bool:
         return self.status == "judged" and bool(self.relevance)
 
+    @property
+    def evaluable(self) -> bool:
+        """Include judged unanswerable queries for abstention diagnostics, not recall."""
+        return self.status == "judged" and (bool(self.relevance) or not self.answerable)
+
     @classmethod
     def from_dict(cls, payload: dict[str, Any], line_number: int | None = None) -> "QueryRecord":
         location = f" on line {line_number}" if line_number else ""

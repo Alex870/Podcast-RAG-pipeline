@@ -1,0 +1,1 @@
+{"query_id":"ci-fact-001","query":"What policy did TFM describe?","category":"direct_fact","expected_speakers":["TFM"],"date_range":{"start":"2026-01-01","end":"2026-12-31"},"relevance":{"ci-leaf-a":3,"ci-position-a":1},"acceptable_node_types":["leaf_chunk","position_card"],"answerable":true,"status":"judged","notes":"Synthetic CI judgment."}

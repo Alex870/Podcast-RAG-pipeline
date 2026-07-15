@@ -1,4 +1,5 @@
 import os
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -12,15 +13,13 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.input_dir, "data")
 
     def test_load_config_reports_invalid_json_location(self):
-        path = Path(".test_tmp_invalid_config.json")
-        try:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "invalid_config.json"
             path.write_text('{"input_dir": "data",}', encoding="utf-8")
             with self.assertRaises(SystemExit) as exc:
                 load_config(path)
             self.assertIn("Invalid JSON in config file", str(exc.exception))
             self.assertIn("Line", str(exc.exception))
-        finally:
-            path.unlink(missing_ok=True)
 
     def test_apply_env_overrides_updates_model_settings(self):
         config = PipelineConfig()

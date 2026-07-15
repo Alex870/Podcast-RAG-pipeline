@@ -22,6 +22,8 @@
         "source_type": "json_transcript",
         "speaker": "Speaker A",
         "speaker_scope": "single"
+        ,"parent_id": "thesis_1"
+        ,"source_segment_ids": ["episode-1:segment:0"]
       }
     },
     {

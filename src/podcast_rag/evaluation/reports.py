@@ -23,6 +23,24 @@ def markdown_report(payload: dict[str, Any]) -> str:
     else:
         lines.append("No judged queries were available.")
 
+    by_category = payload.get("aggregate_by_category") or {}
+    if by_category:
+        lines.extend(["", "## Aggregate Metrics by Category", ""])
+        for category, values in by_category.items():
+            lines.append(f"### {category}")
+            lines.extend(f"- {key}: {float(value):.4f}" for key, value in values.items())
+            lines.append("")
+
+    abstention = payload.get("abstention") or {}
+    if abstention.get("query_count"):
+        lines.extend([
+            "",
+            "## Abstention",
+            "",
+            f"- Queries: {abstention.get('query_count')}",
+            f"- Accuracy: {abstention.get('accuracy')}",
+        ])
+
     lines.extend(["", "## Queries", ""])
     for item in payload.get("queries") or []:
         lines.extend([f"### {item['query_id']}: {item['query']}", "", f"Category: `{item['category']}`", ""])

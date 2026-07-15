@@ -64,6 +64,8 @@ A record is included in ranking metrics only when its status is `judged` and its
 
 ## Captured Results Format
 
+Captured results may be supplied as the JSON object shown below or as JSONL with one query-result object per line. Each query result may include `latency_ms` (or `latency_seconds`), `abstained`, and `abstention_reason` for operational and unanswerable-query diagnostics.
+
 The retriever exports one ranked result list per query:
 
 ```json
@@ -125,12 +127,16 @@ Default paths come from:
 ## Metrics
 
 - `recall@5`, `recall@10`, and `recall@20`: fraction of all positively graded documents retrieved by each cutoff.
+- `precision@5`, `precision@10`, and `precision@20`: positively graded results divided by the cutoff.
 - `mrr@10`: reciprocal rank of the first positively graded result.
 - `ndcg@10`: graded ranking quality, rewarding highly relevant documents near the top.
 - `evidence_coverage@10`: fraction of total positive relevance weight represented in the top ten.
 - `speaker_constraint_precision@10`: fraction of returned top-ten documents matching an expected speaker when specified.
 - `date_constraint_accuracy@10`: fraction satisfying the requested date range when specified.
+- `node_constraint_accuracy@10`: fraction matching `acceptable_node_types` when specified.
 - `node_type_counts@10`: diagnostic composition of leaf chunks, summaries, theses, position cards, and unknown types.
+- `node_type_outcomes@10`: separable returned/relevant counts and recall for each node type.
+- `source_diversity@10`, `duplicate_rate@10`, `latency_ms`, and `result_count`: operational retrieval diagnostics.
 
 Aggregate metrics are arithmetic means over judged queries. Reports also preserve per-query metrics and returned IDs for failure analysis.
 

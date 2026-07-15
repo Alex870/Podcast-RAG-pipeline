@@ -56,6 +56,47 @@ class EvaluationTests(unittest.TestCase):
             self.assertTrue(Path(report["markdown_report_path"]).exists())
             self.assertEqual(len(load_query_set(query_path)), 2)
 
+    def test_ci_fixture_reports_constraint_diversity_duplicates_and_latency(self):
+        fixture_dir = Path(__file__).parent / "fixtures"
+        report = evaluate_retrieval_run(
+            fixture_dir / "judged_queries_v1.jsonl",
+            fixture_dir / "retrieval_results_v1.json",
+            Path(tempfile.mkdtemp()),
+        )
+        metrics = report["queries"][0]["metrics"]
+        self.assertEqual(report["aggregate"]["recall@5"], 1.0)
+        self.assertEqual(metrics["precision@5"], 0.4)
+        self.assertEqual(metrics["speaker_constraint_accuracy@10"], 0.75)
+        self.assertEqual(metrics["date_constraint_accuracy@10"], 0.75)
+        self.assertEqual(metrics["node_constraint_accuracy@10"], 1.0)
+        self.assertEqual(metrics["duplicate_rate@10"], 0.25)
+        self.assertEqual(metrics["source_diversity@10"], 0.5)
+        self.assertEqual(metrics["latency_ms"], 12.5)
+
+    def test_jsonl_results_include_unanswerable_abstention_outcome(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            query_path = root / "queries.jsonl"
+            result_path = root / "results.jsonl"
+            query_path.write_text(
+                json.dumps({
+                    "query_id": "q-unanswerable",
+                    "query": "What is not in the corpus?",
+                    "category": "unanswerable",
+                    "relevance": {},
+                    "answerable": False,
+                    "status": "judged",
+                }) + "\n",
+                encoding="utf-8",
+            )
+            result_path.write_text(
+                json.dumps({"query_id": "q-unanswerable", "results": [], "abstained": True, "abstention_reason": "no evidence"}) + "\n",
+                encoding="utf-8",
+            )
+            report = evaluate_retrieval_run(query_path, result_path, root / "reports")
+            self.assertEqual(report["judged_query_count"], 1)
+            self.assertEqual(report["abstention"]["accuracy"], 1.0)
+
 
 if __name__ == "__main__":
     unittest.main()

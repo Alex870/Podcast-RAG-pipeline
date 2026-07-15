@@ -44,6 +44,7 @@ Each `*.processed_documents.json` file represents one episode. The expected shap
   "schema_version": "2.1",
   "source_path": "episode_speaker_transcript.json",
   "source_fingerprint": "stable fingerprint",
+  "source_transcript_hash": "sha256 of source transcript bytes",
   "representations": {
     "display_text": "page-content-v1",
     "dense_text": "page-content-v1",
@@ -66,6 +67,15 @@ Schema `2.1` adds optional retrieval-specific text without changing the display 
 The cache-level `representations` manifest records the method version for `display_text`, `dense_text`, and `lexical_text`. Schema `2.0` caches without this manifest remain valid and backward-readable.
 
 `page_content` remains authoritative for display and citation. Stable document IDs continue to derive from `page_content`, so adding optional retrieval representations does not change evidence identity.
+
+Schema `2.1` provenance requirements:
+
+- Every leaf has `source_segment_ids`, `source_spans`, or both `start_time` and `end_time` identifying its transcript evidence.
+- Every summary, thesis, and position card has non-empty `child_ids`; the validator follows those links until it reaches leaf evidence.
+- `parent_id` is the structural hierarchy link. Position-card `child_ids` are evidence references and may point to nodes that also belong to the hierarchy.
+- Each serialized node carries `source_node_fingerprint` and `representation_fingerprints` for deterministic audit and delta backfill.
+
+The representation manifest also contains `builder_version` and `config_fingerprint`. A representation fingerprint includes the source cache fingerprint, source-node identity/evidence, builder version, relevant configuration, and the generated representation text. It is separate from `stable_document_id`.
 
 Required document metadata:
 
@@ -98,6 +108,15 @@ Current pipeline defaults:
 Set `embedding_text_mode` to `context-header-v1` only for an explicitly named experiment. The contextual header is deterministic and bounded by `contextual_header_max_chars`. Changing dense representation requires a separate database export and evaluation; it must not be mixed into an existing embedding space.
 
 Downstream compatibility note: schema `2.1` makes these representations available, but the importer and query client must explicitly implement representation selection and lexical indexing before they affect production retrieval.
+
+Existing caches can be upgraded without LLM work:
+
+```powershell
+python .\podcast_rag_pipeline.py --config .\podcast_rag_config.json --backfill-representations
+python .\podcast_rag_pipeline.py --config .\podcast_rag_config.json --export-dense-baseline
+```
+
+The backfill reuses valid hierarchy and position nodes, rebuilds only deterministic metadata/representations, validates evidence closure, and writes a `delta` record. The export contains stable document IDs, `embedding_text`, `page_content`, metadata, and cache manifests for downstream evaluation.
 
 ## Chroma Export
 
