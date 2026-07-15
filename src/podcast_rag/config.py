@@ -72,6 +72,11 @@ class PipelineConfig:
     position_quote_excerpt_chars: int = 360
     fake_llm: bool = False
     model_eval_output_dir: str = "model_eval"
+    embedding_text_mode: str = "page-content-v1"
+    lexical_text_mode: str = "normalized-lexical-v1"
+    contextual_header_max_chars: int = 700
+    retrieval_evaluation_query_set: str = "evaluation/query_sets/podcast-baseline-v1.jsonl"
+    retrieval_evaluation_output_dir: str = "evaluation/results"
 
 def resolve_path(base_dir: Path, value: str) -> Path:
     path = Path(value).expanduser()

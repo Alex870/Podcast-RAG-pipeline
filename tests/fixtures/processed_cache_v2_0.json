@@ -1,0 +1,36 @@
+{
+  "schema_version": "2.0",
+  "source_fingerprint": "fixture-source",
+  "documents": [
+    {
+      "page_content": "Speaker A describes the policy.",
+      "metadata": {
+        "node_id": "leaf_1",
+        "node_type": "leaf_chunk",
+        "level": "leaf",
+        "source": "fixture.json",
+        "episode_id": "episode-1",
+        "episode_title": "Fixture Episode",
+        "episode_date": "2026-01-01",
+        "source_type": "json_transcript",
+        "speaker": "Speaker A",
+        "speaker_scope": "single"
+      }
+    },
+    {
+      "page_content": "The episode discusses the policy.",
+      "metadata": {
+        "node_id": "thesis_1",
+        "node_type": "episode_thesis",
+        "level": "episode",
+        "source": "fixture.json",
+        "episode_id": "episode-1",
+        "episode_title": "Fixture Episode",
+        "episode_date": "2026-01-01",
+        "source_type": "json_transcript",
+        "speaker_scope": "multiple",
+        "child_ids": ["leaf_1"]
+      }
+    }
+  ]
+}

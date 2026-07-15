@@ -9,10 +9,11 @@ from pathlib import Path
 
 import podcast_rag.runtime as runtime
 from podcast_rag.config import PipelineConfig, apply_env_overrides, load_config, resolve_path
+from podcast_rag.evaluation import evaluate_retrieval_run
 from podcast_rag.llm_support import test_model_inference, verify_model_available
 from podcast_rag.pipeline import PodcastRagPipeline
 from podcast_rag.runtime import PIPELINE_VERSION, PROMPT_VERSION, PipelineInterrupted, RunStats, RuntimeControl, request_stop
-from podcast_rag.schema import dumps_schema_summary, validate_processed_documents
+from podcast_rag.schema import dumps_schema_summary, validate_processed_cache, validate_processed_documents
 from podcast_rag.state import (
     load_state,
     mark_state,
@@ -227,7 +228,7 @@ def inspect_processed_cache(config: PipelineConfig, project_dir: Path) -> int:
         try:
             payload = read_json_file(cache_path)
             docs = payload.get("documents") or []
-            validation = validate_processed_documents(docs)
+            validation = validate_processed_cache(payload)
             counts = Counter(validation.counts)
             totals.update(counts)
             status = "valid" if validation.valid else "invalid"
@@ -315,6 +316,29 @@ def evaluate_model(config: PipelineConfig, project_dir: Path, limit: int = 3) ->
     print(f"Model evaluation report saved: {report_path}")
     return 0
 
+
+def evaluate_retrieval(
+    config: PipelineConfig,
+    project_dir: Path,
+    retrieval_results: str,
+    query_set: str | None = None,
+    output_dir: str | None = None,
+) -> int:
+    """Score captured ranked results against a versioned judged query set."""
+    query_set_path = resolve_path(project_dir, query_set or config.retrieval_evaluation_query_set)
+    results_path = resolve_path(project_dir, retrieval_results)
+    report_dir = resolve_path(project_dir, output_dir or config.retrieval_evaluation_output_dir)
+    report = evaluate_retrieval_run(query_set_path, results_path, report_dir)
+    print(
+        f"Retrieval evaluation complete: judged={report['judged_query_count']} "
+        f"skipped={report['skipped_query_count']} strategy={report['strategy_id']}"
+    )
+    for key, value in report["aggregate"].items():
+        print(f"  {key}: {value:.4f}")
+    print(f"JSON report: {report['json_report_path']}")
+    print(f"Markdown report: {report['markdown_report_path']}")
+    return 0
+
 def create_stop_file(config: PipelineConfig, project_dir: Path) -> int:
     stop_file = resolve_path(project_dir, config.stop_file)
     stop_file.parent.mkdir(parents=True, exist_ok=True)
@@ -336,6 +360,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config-doctor", action="store_true", help="Validate operational config and LM Studio settings before a batch.")
     parser.add_argument("--model-eval", action="store_true", help="Run the model-evaluation harness on transcript slices.")
     parser.add_argument("--model-eval-limit", type=int, default=3, help="Maximum transcript files to sample for --model-eval.")
+    parser.add_argument("--retrieval-eval", action="store_true", help="Score captured retrieval results against a judged query set.")
+    parser.add_argument("--retrieval-results", help="Path to captured ranked retrieval results JSON for --retrieval-eval.")
+    parser.add_argument("--query-set", help="Override the configured retrieval evaluation query-set JSONL path.")
+    parser.add_argument("--evaluation-output-dir", help="Override the retrieval evaluation report directory.")
     parser.add_argument("--build-topic-index", action="store_true", help="Build or refresh the cache-only topic index from processed_data.")
     parser.add_argument("--curate-topic-labels", action="store_true", help="Run the optional LM Studio topic-label curation pass during topic-index refresh.")
     parser.add_argument("--fake-llm", action="store_true", help="Use deterministic fake LLM responses for no-LM Studio validation.")
@@ -376,6 +404,16 @@ def main() -> int:
         return config_doctor(config, project_dir)
     if args.model_eval:
         return evaluate_model(config, project_dir, args.model_eval_limit)
+    if args.retrieval_eval:
+        if not args.retrieval_results:
+            raise SystemExit("--retrieval-eval requires --retrieval-results")
+        return evaluate_retrieval(
+            config,
+            project_dir,
+            args.retrieval_results,
+            query_set=args.query_set,
+            output_dir=args.evaluation_output_dir,
+        )
     if args.build_topic_index:
         return build_topic_index(config, project_dir)
 

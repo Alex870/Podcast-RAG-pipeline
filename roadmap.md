@@ -1,103 +1,73 @@
 # Roadmap
 
-This roadmap defines how `Podcast-RAG-pipeline` should evolve to support both the existing `5070 / short-context` path and a new `5090 / high-context` path without breaking existing users.
+`Podcast-RAG-pipeline` converts speaker-labeled transcripts into structured, RAG-ready processed caches. The next stage is a reproducible processing and evaluation system that can use stronger local models when available while preserving deterministic, compatible output for every supported runtime.
 
-## Compatibility Principles
+## Principles
 
-- Keep the current 16 GB GPU flow as the default baseline.
-- Add high-context features as opt-in capabilities, not new minimum requirements.
-- Preserve backward readability for old processed caches.
-- Make richer metadata additive and versioned.
-- Keep deterministic fallbacks for every advanced LLM-dependent feature.
+- Keep the baseline workflow usable on modest local hardware.
+- Treat model, context, and backend as discovered capabilities, not GPU-brand profiles.
+- Make artifacts self-describing, versioned, and backward-readable.
+- Prefer measured retrieval and attribution gains over larger prompts.
+- Never silently accept malformed structured output into a processed cache.
 
-## Shared Runtime Profile Model
+## Current Foundation
 
-- Add `runtime_profile` with values:
-  - `baseline_16gb`
-  - `enhanced_24gb`
-  - `high_context_5090`
-  - `custom`
-- Add `backend` with values such as `lm_studio` and `vllm`.
-- Resolve each profile into concrete settings:
-  - model name
-  - context target
-  - prompt token budget
-  - max parallel requests
-  - structured output support
-  - judge-pass support
+- Speaker-aware ingestion, hierarchical documents, topic indexes, manifests, checkpoints, validation, and run reports.
+- Config, runtime, schema, LLM-support, and test modules.
+- Processed-cache schema `2.1` with backward-readable `2.0` fixtures and versioned display, dense, and lexical representations.
+- Deterministic contextual-header and lexical-text builders that do not alter display text or stable document IDs.
+- A dependency-light retrieval evaluation runner with JSONL judgments, ranked-result input, standard metrics, and JSON/Markdown reports.
 
-## Config And Schema
+## Completed Foundation Work
 
-- Keep existing config keys working unchanged.
-- Add optional config keys:
-  - `runtime_profile`
-  - `backend`
-  - `context_window_tokens`
-  - `prompt_token_budget`
-  - `structured_outputs_enabled`
-  - `judge_model`
-  - `judge_pass_enabled`
-  - `high_context_mode`
-- Extend processed cache metadata with:
-  - `runtime_profile`
-  - `backend`
-  - `model_name`
-  - `model_capabilities`
-  - `structured_output_used`
-  - `judge_pass_used`
-- Version processed cache manifests so old caches still validate and load.
+- The pipeline-side contract and compatibility portion of Priorities 1 and 2 is implemented.
+- Retrieval query templates and scoring infrastructure are implemented; real corpus judgments still require human authoring and review.
+- Retrieval-ready contextual and lexical fields are emitted additively. Dense retrieval remains on `page-content-v1` by default.
+- Cross-project consumption by Chroma DB Import, PodCast Chat, and RAGScope remains follow-on work.
 
-## High-Value Architecture Changes
+## Priority 1: Contracts And Provenance
 
-- Keep the current short-context reduction path as the baseline mode.
-- Add a high-context path that:
-  - increases prompt budgets
-  - reduces lossy rollup pressure
-  - preserves more leaf evidence
-  - keeps speaker/date metadata in scope longer
-- Add structured JSON extraction for position cards when supported by the backend.
-- Keep permissive JSON recovery as fallback when structured outputs are unavailable.
-- Add a second-pass judge flow using a stronger reasoning model only for uncertain or contradictory outputs.
+- Adopt the versioned processed-cache contract and golden fixtures in the importer, chat client, and RAGScope.
+- Record source transcript hash, pipeline/config fingerprint, prompt version, model/backend, and deterministic-versus-LLM stage provenance.
+- Preserve per-node evidence links: episode, timestamps, speaker, parent/child IDs, and source spans.
+- Make schema migration explicit and test old-cache read compatibility.
+- Quarantine or retry invalid structured output; permissive JSON recovery is diagnostic-only.
 
-## Quality Improvements
+## Priority 2: Evaluation Before More Synthesis
 
-- Prefer larger direct evidence windows over aggressive intermediate summarization.
-- Add confidence and provenance flags:
-  - model-generated
-  - deterministic fallback
-  - judge-reviewed
-- Improve temporal synthesis:
-  - preserve episode date metadata at every level
-  - keep speaker attribution explicit through summary layers
-- Add contradiction and ambiguity tagging for position cards.
+- Replace the draft query templates with a human-reviewed podcast query set containing graded chunks and speaker/date constraints.
+- Capture comparable dense, hybrid, and reranked result runs from downstream retrievers.
+- Extend current Recall@k, MRR, nDCG, speaker/date, node-type, and evidence-coverage reports with source diversity and answer-grounding evaluation.
+- Evaluate leaf retrieval, summaries, position cards, and temporal synthesis separately.
+- Run chunking, overlap, hierarchy-depth, prompt-budget, and model ablations.
+- Calibrate any LLM judge against human labels; it is a measurement aid, not ground truth.
 
-## Performance Strategy
+## Priority 3: Capability-Based Local Inference
 
-- Do not globally raise defaults for prompt budgets or batches.
-- Enable larger batches and context only through `high_context_5090` or `custom`.
-- Add vLLM-aware options:
-  - structured outputs
-  - prefix-caching-friendly prompt layouts
-  - chunked prefill-compatible batching
+- Use a capability record: effective context, structured output, concurrency, latency, and loaded-model identity.
+- Support LM Studio and OpenAI-compatible servers first; add vLLM-specific optimizations only when detected.
+- Use native structured output with schema validation and bounded retries.
+- Budget prompts from actual context limits and reserve completion tokens explicitly.
+- Profile prefix-stable prompts and batching before making them defaults.
 
-## Testing
+## Priority 4: Evidence-Preserving Processing
 
-- Add profile-based tests:
-  - `baseline_16gb`
-  - `high_context_5090`
-- Add regression fixtures for:
-  - malformed JSON
-  - missing-context responses
-  - contradictory evidence
-  - judge-pass escalation
-- Add snapshot tests for manifest metadata across profile modes.
+- Add claims, evidence IDs, confidence, ambiguity, and contradiction candidates to position cards.
+- Preserve speaker and date attribution through every hierarchy layer.
+- Tune direct-evidence window sizes against the evaluation set, not intuition.
 
-## Implementation Phases
+## Priority 5: Operations And Tests
 
-1. Add `runtime_profile`, `backend`, and additive manifest/schema fields.
-2. Build a profile resolver that preserves current defaults when unset.
-3. Add high-context prompt budgeting and larger-batch planning behind profile gates.
-4. Add structured-output extraction with fallback to current parsing.
-5. Add optional judge-pass review for low-confidence position cards.
-6. Add profile-aware telemetry and manifests for downstream compatibility.
-7. Add baseline-vs-high-context regression tests and evaluation fixtures.
+- Emit throughput, token, retry, fallback, schema-failure, and cache-reuse telemetry.
+- Add malformed-output, context-overflow, contradictory-evidence, and old-cache fixtures.
+- Add end-to-end contract tests with Chroma DB Import and RAGScope.
+
+## Sequencing
+
+1. Adopt schema `2.1`, representation selection, and compatibility fixtures downstream.
+2. Author and review the first real judged query set.
+3. Capture a `page-content-v1` dense baseline.
+4. Implement and compare lexical fusion and reranking downstream.
+5. Add capability discovery and strict structured output.
+6. Run representation, chunking, and hierarchy ablations.
+7. Promote only measured improvements to defaults.

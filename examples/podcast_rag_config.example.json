@@ -51,7 +51,7 @@
   "checkpoint_dir": "state/file_checkpoints",
   "run_report_dir": "state/run_reports",
   "run_snapshot_path": "state/current_run_snapshot.json",
-  "cache_schema_version": "2.0",
+  "cache_schema_version": "2.1",
   "clustering_reduction": "pca",
   "grouping_mode": "semantic",
   "summary_objective": "speaker_belief",
@@ -60,5 +60,10 @@
   "near_duplicate_threshold": 0.92,
   "position_quote_excerpt_chars": 360,
   "fake_llm": false,
-  "model_eval_output_dir": "model_eval"
+  "model_eval_output_dir": "model_eval",
+  "embedding_text_mode": "page-content-v1",
+  "lexical_text_mode": "normalized-lexical-v1",
+  "contextual_header_max_chars": 700,
+  "retrieval_evaluation_query_set": "evaluation/query_sets/podcast-baseline-v1.jsonl",
+  "retrieval_evaluation_output_dir": "evaluation/results"
 }

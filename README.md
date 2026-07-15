@@ -42,6 +42,41 @@ This benchmark is based on `state/podcast_rag_state.json` elapsed seconds and ep
 - `topics.py`: cache-only topic contribution extraction, delta tracking, and aggregate topic index generation
 - `pipeline.py`: the `PodcastRagPipeline` orchestration class for chunking, summarization, clustering, and position extraction
 - `cli.py`: batch execution, cache inspection, config doctor, and model evaluation entry points
+- `representations/`: deterministic dense and lexical retrieval text builders with versioned manifests
+- `evaluation/`: dependency-light judged query loading, retrieval metrics, and JSON/Markdown reports
+
+## Retrieval Representations
+
+Processed cache schema `2.1` keeps `page_content` as the display and citation source while adding optional `embedding_text` and `lexical_text` fields. The default dense representation remains `page-content-v1`, so upgrading does not silently change existing embedding behavior. `normalized-lexical-v1` preserves source wording and adds searchable episode, date, speaker, topic, claim, and keyword metadata for downstream lexical indexes.
+
+Set `embedding_text_mode` to `context-header-v1` for an experimental deterministic header before the source text. This representation should be evaluated against the default before it is used for a production database.
+
+Schema `2.0` caches remain supported.
+
+## Retrieval Evaluation
+
+The repository includes a versioned JSONL query-set format and computes Recall@5/10/20, MRR@10, nDCG@10, evidence coverage, speaker/date constraint measurements, and node-type composition from captured ranked results. The included query set is a draft template rather than fabricated ground truth; replace it with real questions and stable document relevance judgments.
+
+```powershell
+python .\podcast_rag_pipeline.py `
+  --retrieval-eval `
+  --retrieval-results .\path\to\captured_results.json `
+  --query-set .\evaluation\query_sets\podcast-baseline-v1.jsonl
+```
+
+The expected captured-results shape is shown in `examples/retrieval_results.example.json`. Reports are written as JSON and Markdown under `evaluation/results` by default. Retrieval execution remains the responsibility of Chroma DB Import, PodCast Chat, or RAGScope; this command scores a captured run without requiring Chroma or LM Studio. See [`docs/retrieval-evaluation.md`](docs/retrieval-evaluation.md) for query authoring, result capture, metrics, and report interpretation.
+
+The pipeline now emits the fields needed for downstream contextual and lexical retrieval, but existing versions of Chroma DB Import and PodCast Chat must be upgraded separately before they use those fields. Until then, their established `page_content` dense-vector workflow remains unchanged.
+
+New configuration fields:
+
+| Field | Default | Purpose |
+|---|---|---|
+| `embedding_text_mode` | `page-content-v1` | Selects plain display text or experimental `context-header-v1` for the emitted dense representation. |
+| `lexical_text_mode` | `normalized-lexical-v1` | Selects the emitted lexical representation; use `page-content-v1` to disable metadata enrichment. |
+| `contextual_header_max_chars` | `700` | Bounds the deterministic header when contextual dense text is enabled. |
+| `retrieval_evaluation_query_set` | `evaluation/query_sets/podcast-baseline-v1.jsonl` | Default judged-query JSONL path. |
+| `retrieval_evaluation_output_dir` | `evaluation/results` | Default JSON and Markdown evaluation-report directory. |
 
 ## First-Time Setup
 
@@ -178,7 +213,7 @@ The migration assistant is designed around the same principle. It can copy forwa
 
 To insert or reinsert processed caches into Chroma, use the separate `Chroma DB Import` project.
 
-Processed caches now use schema version `2.0`. Each cache includes a prompt/version manifest, config fingerprint, model and embedding names, source transcript fingerprint and schema version, stable document IDs, cluster telemetry, fallback counts, token maxima, validation counts, and an import manifest for downstream Chroma import.
+New processed caches use schema version `2.1`; schema `2.0` remains readable. Each cache includes a prompt/version manifest, representation manifest, config fingerprint, model and embedding names, source transcript fingerprint and schema version, stable document IDs, cluster telemetry, fallback counts, token maxima, validation counts, and an import manifest for downstream Chroma import.
 
 Within a single file, completed `leaf_chunks`, `hierarchy`, and `positions` stages are checkpointed under `state/file_checkpoints`. If a long episode is interrupted after an expensive stage, the next run can resume from the checkpoint instead of starting over. Set `resume_within_file` to `false` to disable this.
 
@@ -237,6 +272,7 @@ python .\podcast_rag_pipeline.py --config .\podcast_rag_config.json --build-topi
 python .\podcast_rag_pipeline.py --inspect-cache
 python .\podcast_rag_pipeline.py --config-doctor
 python .\podcast_rag_pipeline.py --model-eval --model-eval-limit 3
+python .\podcast_rag_pipeline.py --retrieval-eval --retrieval-results .\path\to\captured_results.json --query-set .\evaluation\query_sets\podcast-baseline-v1.jsonl
 ```
 
 The same commands also work as a module entry point after installation:

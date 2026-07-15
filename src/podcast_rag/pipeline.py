@@ -22,7 +22,8 @@ from podcast_rag.runtime import (
     PipelineInterrupted,
     RuntimeControl,
 )
-from podcast_rag.schema import serialize_document, validate_processed_documents
+from podcast_rag.schema import serialize_document, validate_processed_cache, validate_processed_documents
+from podcast_rag.representations import RepresentationBuilder
 from podcast_rag.state import (
     checkpoint_path,
     docs_from_payloads,
@@ -1009,6 +1010,11 @@ class PodcastRagPipeline:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         self.validate_documents_before_cache(docs, f"cache write {cache_path}")
         validation = validate_processed_documents(docs)
+        representation_builder = RepresentationBuilder(
+            embedding_text_mode=self.config.embedding_text_mode,
+            lexical_text_mode=self.config.lexical_text_mode,
+            contextual_header_max_chars=self.config.contextual_header_max_chars,
+        )
         payload = {
             "version": 2,
             "schema_version": self.config.cache_schema_version,
@@ -1022,6 +1028,7 @@ class PodcastRagPipeline:
             "config_fingerprint": config_fingerprint(self.config),
             "model": self.config.lm_studio_model,
             "embedding_model": self.config.embedding_model,
+            "representations": representation_builder.manifest(),
             "prompt_manifest": self.prompt_manifest,
             "token_maxima": self.performance.snapshot(),
             "fallback_count": self.fallback_count,
@@ -1038,9 +1045,10 @@ class PodcastRagPipeline:
                 "source_fingerprint": fingerprint,
                 "model": self.config.lm_studio_model,
                 "config_fingerprint": config_fingerprint(self.config),
+                "representations": representation_builder.manifest(),
             },
             "document_count": len(docs),
-            "documents": document_payloads(docs, fingerprint),
+            "documents": document_payloads(docs, fingerprint, representation_builder),
         }
         temp_path = cache_path.with_suffix(".tmp")
         temp_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
@@ -1048,6 +1056,9 @@ class PodcastRagPipeline:
 
     def validate_cached_file(self, path: Path, fingerprint: str, cache_path: Path) -> dict[str, Any]:
         print(f"\nValidating cached processed data: {cache_path}")
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+        cache_validation = validate_processed_cache(payload)
+        cache_validation.raise_for_errors(f"cache {cache_path}")
         docs = self.load_cached_documents(cache_path)
         if not docs:
             raise RuntimeError(f"Processed data cache was empty: {cache_path}")

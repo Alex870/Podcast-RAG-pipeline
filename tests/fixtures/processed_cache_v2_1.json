@@ -1,0 +1,45 @@
+{
+  "schema_version": "2.1",
+  "source_fingerprint": "fixture-source",
+  "representations": {
+    "display_text": "page-content-v1",
+    "dense_text": "context-header-v1",
+    "lexical_text": "normalized-lexical-v1"
+  },
+  "documents": [
+    {
+      "page_content": "Speaker A describes the policy.",
+      "embedding_text": "Episode: Fixture Episode\nSpeaker: Speaker A\n\nSpeaker A describes the policy.",
+      "lexical_text": "Speaker A describes the policy Fixture Episode 2026-01-01 Speaker A",
+      "metadata": {
+        "node_id": "leaf_1",
+        "node_type": "leaf_chunk",
+        "level": "leaf",
+        "source": "fixture.json",
+        "episode_id": "episode-1",
+        "episode_title": "Fixture Episode",
+        "episode_date": "2026-01-01",
+        "source_type": "json_transcript",
+        "speaker": "Speaker A",
+        "speaker_scope": "single"
+      }
+    },
+    {
+      "page_content": "The episode discusses the policy.",
+      "embedding_text": "Episode: Fixture Episode\n\nThe episode discusses the policy.",
+      "lexical_text": "The episode discusses the policy Fixture Episode 2026-01-01",
+      "metadata": {
+        "node_id": "thesis_1",
+        "node_type": "episode_thesis",
+        "level": "episode",
+        "source": "fixture.json",
+        "episode_id": "episode-1",
+        "episode_title": "Fixture Episode",
+        "episode_date": "2026-01-01",
+        "source_type": "json_transcript",
+        "speaker_scope": "multiple",
+        "child_ids": ["leaf_1"]
+      }
+    }
+  ]
+}

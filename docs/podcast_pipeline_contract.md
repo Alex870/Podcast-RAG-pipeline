@@ -41,17 +41,31 @@ Each `*.processed_documents.json` file represents one episode. The expected shap
 
 ```json
 {
-  "source_file": "episode_speaker_transcript.json",
+  "schema_version": "2.1",
+  "source_path": "episode_speaker_transcript.json",
   "source_fingerprint": "stable fingerprint",
-  "episode_title": "Episode title",
+  "representations": {
+    "display_text": "page-content-v1",
+    "dense_text": "page-content-v1",
+    "lexical_text": "normalized-lexical-v1"
+  },
   "documents": []
 }
 ```
 
 Each document must contain:
 
-- `page_content`: retrieval text to embed.
+- `page_content`: authoritative display and citation text; also the dense-embedding fallback.
 - `metadata`: Chroma-ready metadata object.
+
+Schema `2.1` adds optional retrieval-specific text without changing the display or citation source:
+
+- `embedding_text`: text selected for dense embedding. Importers fall back to `page_content` when absent.
+- `lexical_text`: text selected for BM25 or sparse indexing. Importers fall back to `page_content` when absent.
+
+The cache-level `representations` manifest records the method version for `display_text`, `dense_text`, and `lexical_text`. Schema `2.0` caches without this manifest remain valid and backward-readable.
+
+`page_content` remains authoritative for display and citation. Stable document IDs continue to derive from `page_content`, so adding optional retrieval representations does not change evidence identity.
 
 Required document metadata:
 
@@ -72,6 +86,18 @@ Embedding metadata:
 
 - `embedding_model`: recommended on each cache or metadata manifest when available.
 - `embedding_dimension`: recommended after vectors are generated.
+
+Importers must record whether they embedded `page_content` or `embedding_text`. Databases built from different representation versions should be treated as distinct retrieval experiments even when they use the same embedding model.
+
+Current pipeline defaults:
+
+- `display_text`: `page-content-v1`
+- `dense_text`: `page-content-v1`
+- `lexical_text`: `normalized-lexical-v1`
+
+Set `embedding_text_mode` to `context-header-v1` only for an explicitly named experiment. The contextual header is deterministic and bounded by `contextual_header_max_chars`. Changing dense representation requires a separate database export and evaluation; it must not be mixed into an existing embedding space.
+
+Downstream compatibility note: schema `2.1` makes these representations available, but the importer and query client must explicitly implement representation selection and lexical indexing before they affect production retrieval.
 
 ## Chroma Export
 
@@ -127,6 +153,7 @@ Episode entries:
 ## Compatibility Rules
 
 - `Podcast-RAG-pipeline`, `Chroma DB Import`, and `PodCast Chat` must agree on the embedding model.
+- The importer and query client must agree on the dense representation version as well as the embedding model.
 - If an export was embedded with one model and queried with another, retrieval distances are unreliable.
 - `episode_sort_key` should be preserved from transcript through Chroma metadata so date filtering works.
 - Omitted speakers should be omitted from export metadata as if they were not imported.

@@ -13,6 +13,7 @@ import podcast_rag.runtime as runtime
 from podcast_rag.config import PipelineConfig, config_fingerprint, resolve_path
 from podcast_rag.runtime import PIPELINE_VERSION, PROMPT_VERSION, PerformanceTracker, RunStats
 from podcast_rag.schema import serialize_document, validate_processed_documents
+from podcast_rag.representations import RepresentationBuilder
 from podcast_rag.text_utils import format_duration, source_schema_version, stable_episode_id
 
 def load_state(state_path: Path) -> dict[str, Any]:
@@ -46,8 +47,27 @@ def write_json_file(path: Path, payload: Any) -> None:
     temp.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
     temp.replace(path)
 
-def document_payloads(docs: list[Any], source_fingerprint_value: str = "") -> list[dict[str, Any]]:
-    return [serialize_document(doc, source_fingerprint_value) for doc in docs]
+def document_payloads(
+    docs: list[Any],
+    source_fingerprint_value: str = "",
+    representation_builder: RepresentationBuilder | None = None,
+) -> list[dict[str, Any]]:
+    payloads = []
+    for doc in docs:
+        page_content = str(getattr(doc, "page_content", "") or "")
+        metadata = dict(getattr(doc, "metadata", {}) or {})
+        embedding_text = lexical_text = None
+        if representation_builder is not None:
+            embedding_text, lexical_text = representation_builder.build(page_content, metadata)
+        payloads.append(
+            serialize_document(
+                doc,
+                source_fingerprint_value,
+                embedding_text=embedding_text,
+                lexical_text=lexical_text,
+            )
+        )
+    return payloads
 
 def docs_from_payloads(payloads: list[dict[str, Any]]) -> list[Any]:
     runtime.load_runtime_deps()
