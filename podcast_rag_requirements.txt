@@ -1,12 +1,13 @@
-hdbscan
-langchain
-langchain-community
-langchain-core
-langchain-huggingface
-langchain-openai
-langchain-text-splitters
-numpy
-openai
-scikit-learn
-sentence-transformers
-umap-learn
+# Direct dependency pins resolved for the Stage 10 clean-machine baseline.
+hdbscan==0.8.44
+langchain==1.3.13
+langchain-community==0.4.2
+langchain-core==1.4.9
+langchain-huggingface==1.2.2
+langchain-openai==1.3.5
+langchain-text-splitters==1.1.2
+numpy==2.4.6
+openai==2.45.0
+scikit-learn==1.9.0
+sentence-transformers==5.6.0
+umap-learn==0.5.12

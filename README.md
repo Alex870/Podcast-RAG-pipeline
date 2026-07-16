@@ -10,6 +10,10 @@ The default workflow targets a local LM Studio server running on Windows 11 usin
 
 The shared transcript, processed-cache, Chroma metadata, and `podcast.json` expectations are documented in [`docs/podcast_pipeline_contract.md`](docs/podcast_pipeline_contract.md).
 
+## Clean-machine packaging
+
+The Windows environment file installs the exact direct dependency pins in `podcast_rag_requirements.txt`. Use `scripts/Test-PodcastRagEnvironment.ps1` before running delta processing, migration, or benchmarks; missing Conda or model-provider access is reported as a prerequisite diagnostic rather than hidden.
+
 ## Local Versus Cloud
 
 For overnight batch processing, local LM Studio processing is the sensible default. A cloud RTX 6000 Pro with 96 GB VRAM may let you run a larger model, a longer context, or more concurrent work, but this pipeline is designed to reduce long transcripts into bounded chunks and summaries. Unless you have a specific larger model in mind that materially improves the summaries, the expected quality gain is probably smaller than the operational cost for routine batches.
