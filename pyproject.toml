@@ -18,3 +18,5 @@ where = ["src"]
 
 [project.scripts]
 podcast-rag-pipeline = "podcast_rag.cli:main"
+podcast-rag-delta = "podcast_rag.delta_cli:main"
+podcast-rag-delta = "podcast_rag.delta_cli:main"
