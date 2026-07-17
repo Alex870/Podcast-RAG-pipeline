@@ -1,0 +1,14 @@
+{
+  "added_document_ids":[],
+  "changed_document_ids":["leaf-1"],
+  "contract_version":"processed-delta-v1",
+  "correction_set_ids":["correction_193e1741de92a8788cbe2b66baaa5e417d28de429ed52c99d7f304714c8aefb7"],
+  "delta_id":"delta_cd4243705ab6f5d00d428f498b61c0837a7e3091980bbc024637244f5c7a5f8f",
+  "failures":[],
+  "invalidated":{"ancestors":["episode-1"],"positions":["position-1"],"topics":["topic-1"]},
+  "old_to_new_evidence":{"leaf-1":"doc_58231c46050ef4317c9d945c9b10a0a4d87ae3e47d6c08c545474d69b0275774"},
+  "parent_cache_ids":["cache-old"],"parent_corpus_id":"corpus-1","processing_fingerprint":"process-v1",
+  "producer":{"contract_version":"1","name":"Podcast-RAG-pipeline"},
+  "reasons":{"leaf-1":"content_or_authoritative_metadata_changed"},"removals_advisory":true,"removed_document_ids":[],
+  "representation_fingerprint":"page-content-v1","stale_judgment_ids":[],"timings_ms":{},"unchanged_document_ids":["same-1"],"validation":{"evidence_closure":true}
+}
