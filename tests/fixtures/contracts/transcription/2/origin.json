@@ -1,0 +1,7 @@
+{
+  "producer_repository": "podcast-host-transcription-pipeline",
+  "producer_commit": "255daf5",
+  "source_path": "tests/contract_exports/transcript-v2.json",
+  "contract_version": "2.0",
+  "files": {"transcript.json": "6ec1467a1505f6c1a9f6eb8688d87fdbd4ae1291a1e5ecb6ce91921a4b07419b"}
+}

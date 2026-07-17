@@ -1,0 +1,9 @@
+{
+  "schema_version": "2.0",
+  "episode_id": "fixture-episode-001",
+  "episode_date": "2026-01-01",
+  "segments": [
+    {"id": "fixture-episode-001:segment:0", "start": 0.0, "end": 4.2, "speaker": "Host", "text": "Welcome to the contract fixture."},
+    {"id": "fixture-episode-001:segment:1", "start": 4.2, "end": 9.0, "speaker": "Guest", "text": "This transcript crosses a repository boundary."}
+  ]
+}
