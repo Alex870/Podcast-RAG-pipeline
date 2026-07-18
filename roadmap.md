@@ -67,3 +67,6 @@ Updated: 2026-07-17
 6. Harden orchestration, migrations, and target-machine operations.
 
 The ecosystem-level sequence and promotion rules live in `../PODCAST_ECOSYSTEM_ROADMAP.md` when these repositories share a workspace.
+## Phases 0–2 implementation status (2026-07-17)
+
+Correction-aware delta planning/application, canonical identities, fixtures, and campaign-bound baseline export are implemented. Real baseline execution awaits the approved private evaluation pack.
