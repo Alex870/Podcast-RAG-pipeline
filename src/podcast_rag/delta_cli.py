@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from .ecosystem_delta import apply_delta, plan_delta, validate_delta, write_atomic
+from .upstream_contracts import discover_correction_notifications
 
 
 def _read(path: str) -> dict:
@@ -17,6 +18,10 @@ def main(argv: list[str] | None = None) -> int:
     plan = commands.add_parser("plan-delta")
     for name in ("old", "new", "correction_set_id", "parent_corpus_id", "processing_fingerprint", "representation_fingerprint", "output"):
         plan.add_argument(f"--{name.replace('_', '-')}", required=True)
+    notification_plan = commands.add_parser("plan-notification-delta")
+    for name in ("project_root", "old", "new", "parent_corpus_id", "processing_fingerprint", "representation_fingerprint", "output"):
+        notification_plan.add_argument(f"--{name.replace('_', '-')}", required=True)
+    notification_plan.add_argument("--correction-set-id")
     apply = commands.add_parser("apply-delta")
     for name in ("delta", "old", "new", "approve_correction_set", "output"):
         apply.add_argument(f"--{name.replace('_', '-')}", required=True)
@@ -29,6 +34,22 @@ def main(argv: list[str] | None = None) -> int:
         value = plan_delta(_read(args.old), _read(args.new), parent_corpus_id=args.parent_corpus_id,
             correction_set_id=args.correction_set_id, processing_fingerprint=args.processing_fingerprint,
             representation_fingerprint=args.representation_fingerprint)
+    elif args.command == "plan-notification-delta":
+        ready = [item for item in discover_correction_notifications(args.project_root) if item["status"] == "ready"]
+        if args.correction_set_id:
+            ready = [item for item in ready if item.get("manifest", {}).get("correction_set_id") == args.correction_set_id]
+        if len(ready) != 1:
+            qualifier = f" matching {args.correction_set_id}" if args.correction_set_id else ""
+            parser.error(f"expected exactly one ready correction notification{qualifier}; found {len(ready)}")
+        manifest = ready[0]["manifest"]
+        value = plan_delta(
+            _read(args.old), _read(args.new), parent_corpus_id=args.parent_corpus_id,
+            correction_set_id=manifest["correction_set_id"],
+            processing_fingerprint=args.processing_fingerprint,
+            representation_fingerprint=args.representation_fingerprint,
+            affected_episode_ids=manifest.get("affected_episode_ids", []),
+            affected_source_span_ids=manifest.get("affected_source_span_ids", []),
+        )
     else:
         value = apply_delta(_read(args.delta), _read(args.old), _read(args.new),
             approved_correction_set_id=args.approve_correction_set)

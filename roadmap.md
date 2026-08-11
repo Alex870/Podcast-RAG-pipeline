@@ -1,8 +1,8 @@
 # Roadmap
 
-Updated: 2026-07-17
+Updated: 2026-08-11
 
-`Podcast-RAG-pipeline` converts contract-valid transcripts into evidence-linked knowledge artifacts. Schema `2.1`, deterministic representations, stable evidence closure, delta backfill, topic indexes, retrieval evaluation, and downstream contract fixtures are implemented. The next value lies in correction-aware incremental processing and measured retrieval improvements.
+`Podcast-RAG-pipeline` converts contract-valid transcripts into evidence-linked knowledge artifacts. Schema `2.1`, deterministic representations, stable evidence closure, correction-notification-scoped delta planning, topic indexes, retrieval evaluation, and downstream contract fixtures are implemented. The next value lies in running the private baseline and measured retrieval improvements.
 
 ## Product Direction
 
@@ -32,10 +32,10 @@ Updated: 2026-07-17
 
 ### 2. Consume human correction change sets
 
-- Accept transcription correction manifests and classify affected episodes, spans, leaf nodes, ancestors, topics, and position cards.
-- Preview recomputation scope and preserve old artifacts until the replacement validates.
-- Emit a processed-cache delta manifest that Chroma Import can reconcile directly.
-- Flag stale judgments when evidence IDs or source hashes change.
+- Implemented: accept validated v1/v2 transcription correction notifications and bind deltas to affected episodes and source spans.
+- Implemented: fail closed when candidate documents contain unrelated corpus drift.
+- Implemented: emit deterministic processed-cache deltas for explicit approval and downstream reconciliation.
+- Next operational proof: execute the flow against the approved private pack and corpus release.
 
 ### 3. Improve retrieval representations through paired experiments
 
@@ -60,13 +60,13 @@ Updated: 2026-07-17
 ## Sequencing
 
 1. Bind the approved evaluation pack and record the dense baseline.
-2. Implement correction-manifest invalidation and processed-cache delta output.
+2. Run the implemented correction-manifest-scoped delta path against the approved private corpus.
 3. Compare lexical fusion, MMR, and lightweight reranking downstream.
 4. Tune representations and hierarchy from per-query evidence.
 5. Add temporal/contradiction structures only where baseline failures justify them.
 6. Harden orchestration, migrations, and target-machine operations.
 
 The ecosystem-level sequence and promotion rules live in `../PODCAST_ECOSYSTEM_ROADMAP.md` when these repositories share a workspace.
-## Phases 0–2 implementation status (2026-07-17)
+## Phases 0–2 implementation status (2026-08-11)
 
-Correction-aware delta planning/application, canonical identities, fixtures, and campaign-bound baseline export are implemented. Real baseline execution awaits the approved private evaluation pack.
+Correction-aware delta planning/application, notification-scoped production CLI integration, canonical identities, fixtures, and campaign-bound baseline export are implemented. Real baseline execution awaits the approved private evaluation pack.

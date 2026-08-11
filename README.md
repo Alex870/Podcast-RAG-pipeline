@@ -221,7 +221,22 @@ To insert or reinsert processed caches into Chroma, use the separate `Chroma DB 
 
 New processed caches use schema version `2.1`; schema `2.0` remains readable. Each cache includes a prompt/version manifest, representation manifest, config fingerprint, model and embedding names, source transcript fingerprint and schema version, stable document IDs, cluster telemetry, fallback counts, token maxima, validation counts, and an import manifest for downstream Chroma import.
 
-The upstream contract reader accepts both `correction-manifest-v1` and `correction-manifest-v2`. V2 approvals expose stable correction and affected-span identities while preserving source-hash and before-value validation. When the transcription project is configured with this repository path, notifications arrive under `state/transcription_corrections`; these are inputs to the existing processed-delta workflow, not a reason to rerun unrelated episodes.
+The upstream contract reader accepts both `correction-manifest-v1` and `correction-manifest-v2`. V2 approvals expose stable correction and affected-span identities while preserving source-hash and before-value validation. When the transcription project is configured with this repository path, notifications arrive under `state/transcription_corrections`; these are inputs to the processed-delta workflow, not a reason to rerun unrelated episodes.
+
+Use the notification-aware planner after producing candidate replacement documents for the corrected episode:
+
+```powershell
+podcast-rag-delta plan-notification-delta `
+  --project-root . `
+  --old .\state\old-documents.json `
+  --new .\state\new-documents.json `
+  --parent-corpus-id corpus-current `
+  --processing-fingerprint processing-current `
+  --representation-fingerprint representation-current `
+  --output .\state\correction-delta.json
+```
+
+The command requires exactly one validated ready notification unless `--correction-set-id` selects one explicitly. It scopes the delta to affected episodes/source spans and refuses unrelated old/new corpus drift rather than hiding it in a correction run.
 
 Within a single file, completed `leaf_chunks`, `hierarchy`, and `positions` stages are checkpointed under `state/file_checkpoints`. If a long episode is interrupted after an expensive stage, the next run can resume from the checkpoint instead of starting over. Set `resume_within_file` to `false` to disable this.
 
