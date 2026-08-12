@@ -1,0 +1,20 @@
+name: M3 temporal research artifacts
+on:
+  push:
+  pull_request:
+jobs:
+  m3-contracts:
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+        python: ["3.12"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Run deterministic M3 tests
+        env:
+          PYTHONPATH: src
+        run: python -m unittest tests.test_m3_temporal_artifacts -v

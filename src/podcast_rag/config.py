@@ -77,6 +77,11 @@ class PipelineConfig:
     contextual_header_max_chars: int = 700
     retrieval_evaluation_query_set: str = "evaluation/query_sets/podcast-baseline-v1.jsonl"
     retrieval_evaluation_output_dir: str = "evaluation/results"
+    temporal_artifact_path: str = "state/temporal_research.json"
+    enable_temporal_artifacts: bool = False
+    enable_temporal_trajectories: bool = False
+    enable_contradiction_candidates: bool = False
+    temporal_missing_interval_days: int = 180
 
 def resolve_path(base_dir: Path, value: str) -> Path:
     path = Path(value).expanduser()
@@ -122,6 +127,11 @@ def generation_config_fingerprint(config: PipelineConfig) -> str:
         "contextual_header_max_chars",
         "retrieval_evaluation_query_set",
         "retrieval_evaluation_output_dir",
+        "temporal_artifact_path",
+        "enable_temporal_artifacts",
+        "enable_temporal_trajectories",
+        "enable_contradiction_candidates",
+        "temporal_missing_interval_days",
     }
     payload = json.dumps(
         {

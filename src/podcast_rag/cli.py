@@ -39,6 +39,7 @@ from podcast_rag.text_utils import (
     token_estimate,
 )
 from podcast_rag.topics import refresh_topic_index
+from podcast_rag.temporal_artifacts import build_temporal_artifacts
 from podcast_rag.transcript import iter_transcript_files, load_transcript_json
 
 def run_batch(config: PipelineConfig, project_dir: Path, one_file: bool) -> int:
@@ -71,6 +72,8 @@ def run_batch(config: PipelineConfig, project_dir: Path, one_file: bool) -> int:
 
     print(f"Found {len(files)} matching files; {len(pending)} pending.")
     if not pending:
+        if config.enable_temporal_artifacts:
+            build_temporal_artifacts(processed_data_dir, resolve_path(project_dir, config.temporal_artifact_path), include_trajectories=config.enable_temporal_trajectories, include_contradiction_candidates=config.enable_contradiction_candidates, missing_interval_days=config.temporal_missing_interval_days)
         return 0
 
     cached_pending = [processed_data_cache_path(processed_data_dir, fingerprint, path).exists() for path, fingerprint in pending]
@@ -198,6 +201,9 @@ def run_batch(config: PipelineConfig, project_dir: Path, one_file: bool) -> int:
             )
         print(f"Topic index path: {topic_summary['topic_index_path']}")
         print(f"Topic curation report: {topic_summary['topic_curation_report_path']}")
+    if config.enable_temporal_artifacts:
+        temporal_summary = build_temporal_artifacts(processed_data_dir, resolve_path(project_dir, config.temporal_artifact_path), include_trajectories=config.enable_temporal_trajectories, include_contradiction_candidates=config.enable_contradiction_candidates, missing_interval_days=config.temporal_missing_interval_days)
+        print(f"Temporal research artifact refreshed: {temporal_summary['output_path']} ({temporal_summary['claim_count']} claims).")
     print("\nBatch run complete.")
     return 0
 
@@ -396,6 +402,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--export-output", help="Output path for --export-dense-baseline.")
     parser.add_argument("--export-representation-corpus", action="store_true", help="Export deterministic display, dense, and lexical corpus representations.")
     parser.add_argument("--build-topic-index", action="store_true", help="Build or refresh the cache-only topic index from processed_data.")
+    parser.add_argument("--build-temporal-artifacts", action="store_true", help="Build optional evidence-bound temporal research artifacts.")
     parser.add_argument("--curate-topic-labels", action="store_true", help="Run the optional LM Studio topic-label curation pass during topic-index refresh.")
     parser.add_argument("--fake-llm", action="store_true", help="Use deterministic fake LLM responses for no-LM Studio validation.")
     return parser.parse_args()
@@ -457,5 +464,15 @@ def main() -> int:
         return 0
     if args.build_topic_index:
         return build_topic_index(config, project_dir)
+    if args.build_temporal_artifacts:
+        result = build_temporal_artifacts(
+            resolve_path(project_dir, config.processed_data_dir),
+            resolve_path(project_dir, config.temporal_artifact_path),
+            include_trajectories=config.enable_temporal_trajectories,
+            include_contradiction_candidates=config.enable_contradiction_candidates,
+            missing_interval_days=config.temporal_missing_interval_days,
+        )
+        print(result)
+        return 0
 
     return run_batch(config, project_dir, args.one_file)
