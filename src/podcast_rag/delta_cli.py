@@ -6,6 +6,7 @@ from pathlib import Path
 
 from .ecosystem_delta import apply_delta, plan_delta, validate_delta, write_atomic
 from .upstream_contracts import discover_correction_notifications
+from .delta_jobs import DeltaJobStore, apply_job, plan_notification_job
 
 
 def _read(path: str) -> dict:
@@ -27,9 +28,33 @@ def main(argv: list[str] | None = None) -> int:
         apply.add_argument(f"--{name.replace('_', '-')}", required=True)
     check = commands.add_parser("validate")
     check.add_argument("delta")
+    job_plan = commands.add_parser("plan-notification-job")
+    for name in ("project_root", "old", "new", "output", "job_root", "parent_corpus_id", "processing_fingerprint", "representation_fingerprint"):
+        job_plan.add_argument(f"--{name.replace('_', '-')}", required=True)
+    job_plan.add_argument("--correction-set-id")
+    job_apply = commands.add_parser("apply-job")
+    job_apply.add_argument("job_id"); job_apply.add_argument("--job-root", required=True); job_apply.add_argument("--approve-delta", required=True)
+    job_status = commands.add_parser("job-status")
+    job_status.add_argument("job_id"); job_status.add_argument("--job-root", required=True)
+    job_cancel = commands.add_parser("cancel-job")
+    job_cancel.add_argument("job_id"); job_cancel.add_argument("--job-root", required=True)
     args = parser.parse_args(argv)
     if args.command == "validate":
         validate_delta(_read(args.delta)); return 0
+    if args.command == "plan-notification-job":
+        value = plan_notification_job(
+            project_root=Path(args.project_root), old_path=Path(args.old), new_path=Path(args.new),
+            output_path=Path(args.output), job_root=Path(args.job_root), parent_corpus_id=args.parent_corpus_id,
+            processing_fingerprint=args.processing_fingerprint, representation_fingerprint=args.representation_fingerprint,
+            correction_set_id=args.correction_set_id,
+        )
+        print(value["job_id"]); return 0
+    if args.command in {"apply-job", "job-status", "cancel-job"}:
+        store = DeltaJobStore(Path(args.job_root))
+        if args.command == "apply-job": value = apply_job(store, args.job_id, approved_delta_id=args.approve_delta)
+        elif args.command == "cancel-job": value = store.cancel(args.job_id)
+        else: value = store.load(args.job_id)
+        print(json.dumps(value, sort_keys=True)); return 0
     if args.command == "plan-delta":
         value = plan_delta(_read(args.old), _read(args.new), parent_corpus_id=args.parent_corpus_id,
             correction_set_id=args.correction_set_id, processing_fingerprint=args.processing_fingerprint,
