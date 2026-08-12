@@ -221,6 +221,52 @@ def export_dense_baseline(processed_data_dir: Path, output_path: Path, represent
     output_path.write_text(json.dumps(export, indent=2, ensure_ascii=True), encoding="utf-8")
     return {"output_path": str(output_path), "document_count": len(records), "cache_count": len(manifests)}
 
+
+def export_representation_corpus(processed_data_dir: Path, output_path: Path) -> dict[str, Any]:
+    """Export display/dense/lexical representations with corpus-level coverage evidence."""
+    documents: list[dict[str, Any]] = []
+    omissions: list[dict[str, str]] = []
+    cache_ids: list[str] = []
+    representation_ids: set[tuple[str, str, str]] = set()
+    for cache_path in sorted(processed_data_dir.glob("*.processed_documents.json")):
+        payload = read_json_file(cache_path)
+        validate_processed_cache(payload).raise_for_errors(f"cache {cache_path}")
+        manifest = payload.get("representations") or {}
+        representation_ids.add((str(manifest.get("display_text") or ""), str(manifest.get("dense_text") or ""), str(manifest.get("lexical_text") or "")))
+        cache_ids.append(str(payload.get("source_fingerprint") or cache_path.name))
+        for item in payload.get("documents") or []:
+            metadata = dict(item.get("metadata") or {})
+            document_id = str(metadata.get("stable_document_id") or metadata.get("node_id") or "")
+            missing = [field for field in ("page_content", "embedding_text", "lexical_text") if not str(item.get(field) or "").strip()]
+            if not document_id or missing:
+                omissions.append({"document_id": document_id or "unresolved", "reason": "missing " + ", ".join(missing or ["stable_document_id"])})
+                continue
+            metadata.setdefault("stable_document_id", document_id)
+            fingerprints=dict(metadata.get("representation_fingerprints") or {})
+            for field in ("display_text","dense_text","lexical_text"):
+                if not fingerprints.get(field):
+                    source_field={"display_text":"page_content","dense_text":"embedding_text","lexical_text":"lexical_text"}[field]
+                    fingerprints[field]=hashlib.sha256(str(item.get(source_field) or "").encode("utf-8")).hexdigest()
+            documents.append({
+                "document_id": document_id, "display_text": item["page_content"], "dense_text": item["embedding_text"],
+                "lexical_text": item["lexical_text"], "metadata": metadata,
+                "representation_fingerprints": fingerprints,
+            })
+    if len(representation_ids) > 1:
+        raise ValueError("corpus contains incompatible representation manifests")
+    documents.sort(key=lambda item: item["document_id"])
+    representation = next(iter(representation_ids), ("", "", ""))
+    identity_payload = [{"document_id": item["document_id"], "fingerprints": item["representation_fingerprints"]} for item in documents]
+    export = {
+        "contract_version": "representation-corpus-1.0", "producer": "podcast-rag-pipeline",
+        "representations": {"display_text": representation[0], "dense_text": representation[1], "lexical_text": representation[2]},
+        "document_count": len(documents), "coverage": {"included": len(documents), "omitted": len(omissions), "omissions": omissions},
+        "source_cache_ids": sorted(cache_ids), "documents": documents,
+        "corpus_representation_id": "representation_corpus_" + hashlib.sha256(json.dumps(identity_payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+    }
+    write_json_file(output_path, export)
+    return {"output_path": str(output_path), "document_count": len(documents), "omitted": len(omissions), "corpus_representation_id": export["corpus_representation_id"]}
+
 def docs_from_payloads(payloads: list[dict[str, Any]]) -> list[Any]:
     runtime.load_runtime_deps()
     Document = runtime.Document

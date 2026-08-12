@@ -28,6 +28,7 @@ from podcast_rag.state import (
     should_skip_file,
     backfill_cache_file,
     export_dense_baseline,
+    export_representation_corpus,
 )
 from podcast_rag.text_utils import (
     deterministic_topic_tags,
@@ -393,6 +394,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cache-path", help="Backfill one processed cache instead of all caches.")
     parser.add_argument("--export-dense-baseline", action="store_true", help="Export page-content-v1 dense documents for downstream evaluation.")
     parser.add_argument("--export-output", help="Output path for --export-dense-baseline.")
+    parser.add_argument("--export-representation-corpus", action="store_true", help="Export deterministic display, dense, and lexical corpus representations.")
     parser.add_argument("--build-topic-index", action="store_true", help="Build or refresh the cache-only topic index from processed_data.")
     parser.add_argument("--curate-topic-labels", action="store_true", help="Run the optional LM Studio topic-label curation pass during topic-index refresh.")
     parser.add_argument("--fake-llm", action="store_true", help="Use deterministic fake LLM responses for no-LM Studio validation.")
@@ -447,6 +449,12 @@ def main() -> int:
         return backfill_representations(config, project_dir, args.cache_path)
     if args.export_dense_baseline:
         return export_dense_retrieval_baseline(config, project_dir, args.export_output)
+    if args.export_representation_corpus:
+        if not args.export_output:
+            raise SystemExit("--export-representation-corpus requires --export-output")
+        result = export_representation_corpus(resolve_path(project_dir, config.processed_data_dir), Path(args.export_output))
+        print(result)
+        return 0
     if args.build_topic_index:
         return build_topic_index(config, project_dir)
 
