@@ -7,6 +7,7 @@ from pathlib import Path
 from podcast_rag.upstream_contracts import (
     UpstreamContractError,
     discover_correction_notifications,
+    parse_episode_contract,
     parse_correction_fixture,
 )
 
@@ -29,6 +30,20 @@ def _refresh_v2_identity(manifest: dict) -> None:
 
 
 class UpstreamContractTests(unittest.TestCase):
+    def test_episode_contract_accepts_additive_speech_provenance_without_changing_spans(self):
+        parsed = parse_episode_contract(FIXTURES / "episode-contract-v2" / "speech-provenance.json")
+        self.assertEqual(parsed["source_span_ids"], ["episode-speech-shadow-001:segment:0"])
+
+    def test_episode_contract_requires_explicit_supersession_lineage(self):
+        fixture = FIXTURES / "2" / "transcript.json"
+        payload = json.loads(fixture.read_text(encoding="utf-8"))
+        payload["segments"][0]["supersedes_source_span_id"] = payload["segments"][0]["id"]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "episode.json"
+            _write_payload(path, payload)
+            with self.assertRaisesRegex(UpstreamContractError, "correction_set_id"):
+                parse_episode_contract(path)
+
     def test_parses_v1_fixture(self):
         parsed = parse_correction_fixture(FIXTURES / "correction-manifest-v1" / "valid.json")
         self.assertEqual(parsed["normalized_contract_version"], "correction-manifest-v2")

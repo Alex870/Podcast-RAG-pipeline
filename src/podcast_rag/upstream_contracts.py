@@ -17,6 +17,48 @@ class UpstreamContractError(ValueError):
     pass
 
 
+def parse_episode_contract(path: str | Path) -> dict[str, Any]:
+    value = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise UpstreamContractError("episode contract must be an object")
+    version = str(value.get("contract_version") or value.get("schema_version") or "")
+    try:
+        major = int(version.removeprefix("episode-contract-v").split(".", 1)[0])
+    except ValueError as exc:
+        raise UpstreamContractError(f"invalid episode contract version: {version}") from exc
+    if major != 2:
+        raise UpstreamContractError(f"unsupported episode contract major {version}; upgrade Podcast RAG")
+    episode_id = str(value.get("episode_id") or value.get("episode_uid") or "").strip()
+    if not episode_id:
+        raise UpstreamContractError("episode identity missing")
+    segments = value.get("segments")
+    if not isinstance(segments, list):
+        raise UpstreamContractError("episode segments must be a list")
+    source_span_ids = []
+    for segment in segments:
+        if not isinstance(segment, dict):
+            raise UpstreamContractError("episode segment must be an object")
+        source_span_id = str(segment.get("source_span_id") or segment.get("id") or "").strip()
+        if not source_span_id:
+            raise UpstreamContractError("stable source span identity missing")
+        source_span_ids.append(source_span_id)
+        if segment.get("supersedes_source_span_id") and not segment.get("correction_set_id"):
+            raise UpstreamContractError("superseded evidence requires an explicit correction_set_id")
+    if len(source_span_ids) != len(set(source_span_ids)):
+        raise UpstreamContractError("duplicate source span identity")
+    speech_provenance = value.get("speech_provenance") or []
+    if not isinstance(speech_provenance, list):
+        raise UpstreamContractError("speech_provenance must be additive provider records")
+    for provider in speech_provenance:
+        if not isinstance(provider, dict) or not provider.get("provider") or not provider.get("model_revision"):
+            raise UpstreamContractError("speech provider provenance requires provider and immutable model_revision")
+    result = dict(value)
+    result["normalized_contract_version"] = "episode-contract-v2"
+    result["source_span_ids"] = source_span_ids
+    result["speech_provenance"] = speech_provenance
+    return result
+
+
 def _canonical(value: Any) -> bytes:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
