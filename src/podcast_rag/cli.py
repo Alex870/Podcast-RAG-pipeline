@@ -40,6 +40,7 @@ from podcast_rag.text_utils import (
 )
 from podcast_rag.topics import refresh_topic_index
 from podcast_rag.temporal_artifacts import build_temporal_artifacts
+from podcast_rag.advanced_retrieval import build_evidence_graph, build_late_chunk_alignment
 from podcast_rag.transcript import iter_transcript_files, load_transcript_json
 
 def run_batch(config: PipelineConfig, project_dir: Path, one_file: bool) -> int:
@@ -403,6 +404,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--export-representation-corpus", action="store_true", help="Export deterministic display, dense, and lexical corpus representations.")
     parser.add_argument("--build-topic-index", action="store_true", help="Build or refresh the cache-only topic index from processed_data.")
     parser.add_argument("--build-temporal-artifacts", action="store_true", help="Build optional evidence-bound temporal research artifacts.")
+    parser.add_argument("--build-advanced-retrieval", action="store_true", help="Build gated M5 prototype sidecars without promoting them.")
+    parser.add_argument("--m5-entry-gate", help="Path to a completed advanced-retrieval-entry-gate-1.0 JSON file.")
+    parser.add_argument("--corpus-release-id", help="Immutable parent corpus release for M5 sidecars.")
     parser.add_argument("--curate-topic-labels", action="store_true", help="Run the optional LM Studio topic-label curation pass during topic-index refresh.")
     parser.add_argument("--fake-llm", action="store_true", help="Use deterministic fake LLM responses for no-LM Studio validation.")
     return parser.parse_args()
@@ -473,6 +477,19 @@ def main() -> int:
             missing_interval_days=config.temporal_missing_interval_days,
         )
         print(result)
+        return 0
+    if args.build_advanced_retrieval:
+        if not config.enable_advanced_retrieval_prototypes:
+            raise SystemExit("M5 prototypes are disabled; set enable_advanced_retrieval_prototypes=true")
+        if not args.m5_entry_gate or not args.corpus_release_id:
+            raise SystemExit("--build-advanced-retrieval requires --m5-entry-gate and --corpus-release-id")
+        import json
+        gate = json.loads(resolve_path(project_dir, args.m5_entry_gate).read_text(encoding="utf-8"))
+        destination = resolve_path(project_dir, config.advanced_retrieval_dir) / args.corpus_release_id
+        temporal = resolve_path(project_dir, config.temporal_artifact_path)
+        graph = build_evidence_graph(resolve_path(project_dir, config.processed_data_dir), temporal, destination / "evidence-graph.json", corpus_release_id=args.corpus_release_id, entry_gate=gate)
+        alignment = build_late_chunk_alignment(resolve_path(project_dir, config.processed_data_dir), destination / "late-chunk-alignment.json", corpus_release_id=args.corpus_release_id, entry_gate=gate, model_id=config.embedding_model, model_revision=str(gate.get("model_revision") or "unresolved"), tokenizer_id=str(gate.get("tokenizer_id") or config.embedding_model))
+        print({"graph_id": graph["graph_id"], "alignment_id": alignment["alignment_id"], "disposition": "prototype"})
         return 0
 
     return run_batch(config, project_dir, args.one_file)

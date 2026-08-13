@@ -82,6 +82,8 @@ class PipelineConfig:
     enable_temporal_trajectories: bool = False
     enable_contradiction_candidates: bool = False
     temporal_missing_interval_days: int = 180
+    enable_advanced_retrieval_prototypes: bool = False
+    advanced_retrieval_dir: str = "state/advanced_retrieval"
 
 def resolve_path(base_dir: Path, value: str) -> Path:
     path = Path(value).expanduser()
@@ -132,6 +134,8 @@ def generation_config_fingerprint(config: PipelineConfig) -> str:
         "enable_temporal_trajectories",
         "enable_contradiction_candidates",
         "temporal_missing_interval_days",
+        "enable_advanced_retrieval_prototypes",
+        "advanced_retrieval_dir",
     }
     payload = json.dumps(
         {
