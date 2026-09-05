@@ -1,5 +1,7 @@
 # Podcast Pipeline Data Contract
 
+> **Podcast-RAG consumer contract:** the detailed normative handoff for redesigning this consumer is [Transcription Handoff Contract](transcription-handoff-contract.md). This document remains the shorter ecosystem-wide reference.
+
 This document describes the JSON and Chroma metadata contract shared by the four podcast tools:
 
 1. `Podcast-Host-Transcription-Pipeline`

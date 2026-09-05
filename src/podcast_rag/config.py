@@ -10,6 +10,7 @@ from podcast_rag.schema import PROCESSED_CACHE_SCHEMA_VERSION
 
 @dataclass
 class PipelineConfig:
+    partition_registry_path: str = "partitions/registry.json"
     input_dir: str = "data"
     file_glob: str = "**/*_speaker_transcript.json"
     processed_dir: str = "processed"
@@ -18,6 +19,11 @@ class PipelineConfig:
     control_file: str = "state/pipeline_control.json"
     processed_data_dir: str = "processed_data"
     debug_output_dir: str = "debug_output"
+    errata_dir: str = "errata"
+    errata_enabled: bool = True
+    errata_llm_on_anomaly: bool = True
+    errata_review_context_max_chars: int = 12000
+    errata_excerpt_max_chars: int = 360
     move_processed_files: bool = False
     embedding_model: str = "BAAI/bge-large-en-v1.5"
     lm_studio_base_url: str = "http://127.0.0.1:1234/v1"
@@ -117,13 +123,54 @@ def apply_env_overrides(config: PipelineConfig) -> PipelineConfig:
 
 def config_fingerprint(config: PipelineConfig) -> str:
     """Create a stable hash of effective config values for cache provenance."""
-    payload = json.dumps({field.name: getattr(config, field.name) for field in fields(config)}, sort_keys=True, default=str)
+    path_fields = {
+        "partition_registry_path",
+        "input_dir",
+        "processed_dir",
+        "state_path",
+        "stop_file",
+        "control_file",
+        "processed_data_dir",
+        "debug_output_dir",
+        "errata_dir",
+        "checkpoint_dir",
+        "run_report_dir",
+        "run_snapshot_path",
+        "topic_contribution_dir",
+        "topic_index_path",
+        "topic_index_manifest_path",
+        "topic_blacklist_path",
+        "topic_whitelist_path",
+        "topic_curation_report_path",
+        "model_eval_output_dir",
+        "retrieval_evaluation_query_set",
+        "retrieval_evaluation_output_dir",
+        "temporal_artifact_path",
+        "advanced_retrieval_dir",
+    }
+    secret_fields = {"lm_studio_api_key"}
+    payload = json.dumps(
+        {
+            field.name: getattr(config, field.name)
+            for field in fields(config)
+            if field.name not in path_fields and field.name not in secret_fields
+        },
+        sort_keys=True,
+        default=str,
+    )
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()
 
 
 def generation_config_fingerprint(config: PipelineConfig) -> str:
     """Fingerprint settings that can invalidate LLM-generated hierarchy/position nodes."""
     representation_only = {
+        # Errata settings affect diagnostics only; they must not force generated
+        # hierarchy or position checkpoints to be rebuilt.
+        "errata_dir",
+        "errata_enabled",
+        "errata_llm_on_anomaly",
+        "errata_review_context_max_chars",
+        "errata_excerpt_max_chars",
         "embedding_text_mode",
         "lexical_text_mode",
         "contextual_header_max_chars",

@@ -1,6 +1,7 @@
 .env
 podcast_rag_config.json
 data/
+partitions/
 processed/
 processed_data/
 debug_output/

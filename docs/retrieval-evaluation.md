@@ -22,10 +22,10 @@ Query sets use JSON Lines, with one JSON object per line:
 
 ```json
 {
-  "query_id": "tfm-001",
-  "query": "What did TFM say about multipolarity?",
+  "query_id": "podcast-001",
+  "query": "What did the host say about multipolarity?",
   "category": "speaker_position",
-  "expected_speakers": ["TFM"],
+  "expected_speakers": ["HOST"],
   "date_range": null,
   "relevance": {
     "stable-document-id-a": 3,
@@ -70,23 +70,23 @@ The retriever exports one ranked result list per query:
 
 ```json
 {
-  "run_id": "tfm-dense-baseline-20260711",
+  "run_id": "podcast-dense-baseline-20260711",
   "strategy_id": "dense-only",
   "manifest": {
     "embedding_model": "BAAI/bge-large-en-v1.5",
     "representation": "page-content-v1",
-    "database_id": "tfm-baseline"
+    "database_id": "podcast-baseline"
   },
   "queries": [
     {
-      "query_id": "tfm-001",
+      "query_id": "podcast-001",
       "results": [
         {
           "document_id": "stable-document-id-a",
           "score": 0.81,
           "metadata": {
             "node_type": "leaf_chunk",
-            "speaker": "TFM",
+            "speaker": "HOST",
             "episode_date": "2025-04-12"
           }
         }
@@ -106,7 +106,7 @@ The manifest should identify every factor needed to reproduce the run, including
 python .\podcast_rag_pipeline.py `
   --config .\podcast_rag_config.json `
   --retrieval-eval `
-  --retrieval-results .\evaluation\runs\tfm-dense-baseline.json `
+  --retrieval-results .\evaluation\runs\podcast-dense-baseline.json `
   --query-set .\evaluation\query_sets\podcast-baseline-v1.jsonl
 ```
 
@@ -115,8 +115,8 @@ Optional output override:
 ```powershell
 python .\podcast_rag_pipeline.py `
   --retrieval-eval `
-  --retrieval-results .\evaluation\runs\tfm-dense-baseline.json `
-  --evaluation-output-dir .\evaluation\results\tfm
+  --retrieval-results .\evaluation\runs\podcast-dense-baseline.json `
+  --evaluation-output-dir .\evaluation\results\podcast
 ```
 
 Default paths come from:

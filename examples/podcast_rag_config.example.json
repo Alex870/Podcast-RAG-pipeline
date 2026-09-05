@@ -1,4 +1,5 @@
 {
+  "partition_registry_path": "partitions/registry.json",
   "input_dir": "data",
   "file_glob": "**/*_speaker_transcript.json",
   "processed_dir": "processed",
@@ -16,6 +17,11 @@
   "enable_llm_topic_label_curation": false,
   "llm_topic_label_curation_limit": 250,
   "debug_output_dir": "debug_output",
+  "errata_dir": "errata",
+  "errata_enabled": true,
+  "errata_llm_on_anomaly": true,
+  "errata_review_context_max_chars": 12000,
+  "errata_excerpt_max_chars": 360,
   "move_processed_files": false,
   "podcast_id": "",
   "podcast_name": "",

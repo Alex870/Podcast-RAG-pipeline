@@ -78,15 +78,15 @@ class TopicIndexTests(unittest.TestCase):
             processed_data = root / "processed_data"
             processed_data.mkdir()
             _write_cache(
-                processed_data / "TFM_20260516_speaker_transcript.raw.processed_documents.json",
-                r"D:\Pod Cast RAG\podcast-host-transcription-pipeline\output\TFM 20260516_speaker_transcript.json",
+                processed_data / "podcast_20260516_speaker_transcript.raw.processed_documents.json",
+                r"D:\Pod Cast RAG\podcast-host-transcription-pipeline\output\podcast 20260516_speaker_transcript.json",
                 "rawfingerprint",
                 "Inflation",
                 "Raw cache claim",
             )
             _write_cache(
-                processed_data / "TFM_20260516_cleaned_speaker_transcript.cleaned.processed_documents.json",
-                r"D:\Pod Cast RAG\podcast-host-transcription-pipeline\output\TFM 20260516_cleaned_speaker_transcript.json",
+                processed_data / "podcast_20260516_cleaned_speaker_transcript.cleaned.processed_documents.json",
+                r"D:\Pod Cast RAG\podcast-host-transcription-pipeline\output\podcast 20260516_cleaned_speaker_transcript.json",
                 "cleanfingerprint",
                 "Ukraine war",
                 "Cleaned cache claim",
@@ -97,15 +97,15 @@ class TopicIndexTests(unittest.TestCase):
                 topic_contribution_dir="state/topic_contributions",
                 topic_index_path="state/topic_index.json",
                 topic_index_manifest_path="state/topic_index_manifest.json",
-                podcast_id="tfm",
-                podcast_name="TFM",
+                podcast_id="podcast",
+                podcast_name="Podcast",
             )
             summary = refresh_topic_index(config, root)
             self.assertEqual(summary["episode_count"], 1)
             self.assertEqual(summary["rebuilt_contributions"], 1)
 
             topic_index = json.loads((root / "state" / "topic_index.json").read_text(encoding="utf-8"))
-            self.assertEqual(topic_index["podcasts"][0]["podcast_id"], "tfm")
+            self.assertEqual(topic_index["podcasts"][0]["podcast_id"], "podcast")
             labels = [topic["label"] for topic in topic_index["topics"]]
             self.assertIn("Ukraine War", labels)
             self.assertNotIn("Inflation", labels)
@@ -118,8 +118,8 @@ class TopicIndexTests(unittest.TestCase):
             processed_data = root / "processed_data"
             processed_data.mkdir()
             _write_cache(
-                processed_data / "TFM_20260516_cleaned_speaker_transcript.cleaned.processed_documents.json",
-                r"D:\Pod Cast RAG\podcast-host-transcription-pipeline\output\TFM 20260516_cleaned_speaker_transcript.json",
+                processed_data / "podcast_20260516_cleaned_speaker_transcript.cleaned.processed_documents.json",
+                r"D:\Pod Cast RAG\podcast-host-transcription-pipeline\output\podcast 20260516_cleaned_speaker_transcript.json",
                 "cleanfingerprint",
                 "Federal Reserve",
                 "The Fed is boxed in.",
@@ -129,8 +129,8 @@ class TopicIndexTests(unittest.TestCase):
                 topic_contribution_dir="state/topic_contributions",
                 topic_index_path="state/topic_index.json",
                 topic_index_manifest_path="state/topic_index_manifest.json",
-                podcast_id="tfm",
-                podcast_name="TFM",
+                podcast_id="podcast",
+                podcast_name="Podcast",
             )
 
             first = refresh_topic_index(config, root)
@@ -148,8 +148,8 @@ class TopicIndexTests(unittest.TestCase):
             processed_data = root / "processed_data"
             processed_data.mkdir()
             _write_cache(
-                processed_data / "TFM_20260516_cleaned_speaker_transcript.cleaned.processed_documents.json",
-                r"D:\Pod Cast RAG\podcast-host-transcription-pipeline\output\TFM 20260516_cleaned_speaker_transcript.json",
+                processed_data / "podcast_20260516_cleaned_speaker_transcript.cleaned.processed_documents.json",
+                r"D:\Pod Cast RAG\podcast-host-transcription-pipeline\output\podcast 20260516_cleaned_speaker_transcript.json",
                 "cleanfingerprint",
                 "Advocates",
                 "The host strongly supports this.",
@@ -159,8 +159,8 @@ class TopicIndexTests(unittest.TestCase):
                 topic_contribution_dir="state/topic_contributions",
                 topic_index_path="state/topic_index.json",
                 topic_index_manifest_path="state/topic_index_manifest.json",
-                podcast_id="tfm",
-                podcast_name="TFM",
+                podcast_id="podcast",
+                podcast_name="Podcast",
             )
 
             refresh_topic_index(config, root)
@@ -175,15 +175,15 @@ class TopicIndexTests(unittest.TestCase):
             processed_data = root / "processed_data"
             processed_data.mkdir()
             _write_cache(
-                processed_data / "TFM_20260516_cleaned_speaker_transcript.cleaned.processed_documents.json",
-                r"D:\Pod Cast RAG\podcast-host-transcription-pipeline\output\TFM 20260516_cleaned_speaker_transcript.json",
+                processed_data / "podcast_20260516_cleaned_speaker_transcript.cleaned.processed_documents.json",
+                r"D:\Pod Cast RAG\podcast-host-transcription-pipeline\output\podcast 20260516_cleaned_speaker_transcript.json",
                 "cleanfingerprint",
                 "Speaker 02",
                 "This is not a real topic.",
             )
             _write_cache(
-                processed_data / "TFM_20260517_cleaned_speaker_transcript.cleaned.processed_documents.json",
-                r"D:\Pod Cast RAG\podcast-host-transcription-pipeline\output\TFM 20260517_cleaned_speaker_transcript.json",
+                processed_data / "podcast_20260517_cleaned_speaker_transcript.cleaned.processed_documents.json",
+                r"D:\Pod Cast RAG\podcast-host-transcription-pipeline\output\podcast 20260517_cleaned_speaker_transcript.json",
                 "anotherfinger",
                 "Using",
                 "This is also not a real topic.",
@@ -193,8 +193,8 @@ class TopicIndexTests(unittest.TestCase):
                 topic_contribution_dir="state/topic_contributions",
                 topic_index_path="state/topic_index.json",
                 topic_index_manifest_path="state/topic_index_manifest.json",
-                podcast_id="tfm",
-                podcast_name="TFM",
+                podcast_id="podcast",
+                podcast_name="Podcast",
             )
 
             refresh_topic_index(config, root)
@@ -213,8 +213,8 @@ class TopicIndexTests(unittest.TestCase):
             processed_data = root / "processed_data"
             processed_data.mkdir()
             _write_cache(
-                processed_data / "TFM_20260516_cleaned_speaker_transcript.cleaned.processed_documents.json",
-                r"D:\Pod Cast RAG\podcast-host-transcription-pipeline\output\TFM 20260516_cleaned_speaker_transcript.json",
+                processed_data / "podcast_20260516_cleaned_speaker_transcript.cleaned.processed_documents.json",
+                r"D:\Pod Cast RAG\podcast-host-transcription-pipeline\output\podcast 20260516_cleaned_speaker_transcript.json",
                 "cleanfingerprint",
                 "Low maintenance",
                 "The host keeps returning to low maintenance systems.",
@@ -227,8 +227,8 @@ class TopicIndexTests(unittest.TestCase):
                 topic_index_manifest_path="state/topic_index_manifest.json",
                 topic_blacklist_path="state/topic_label_blacklist.json",
                 topic_whitelist_path="state/topic_label_whitelist.json",
-                podcast_id="tfm",
-                podcast_name="TFM",
+                podcast_id="podcast",
+                podcast_name="Podcast",
             )
 
             refresh_topic_index(config, root)
@@ -245,8 +245,8 @@ class TopicIndexTests(unittest.TestCase):
             processed_data = root / "processed_data"
             processed_data.mkdir()
             _write_cache(
-                processed_data / "TFM_20260516_cleaned_speaker_transcript.cleaned.processed_documents.json",
-                r"D:\Pod Cast RAG\podcast-host-transcription-pipeline\output\TFM 20260516_cleaned_speaker_transcript.json",
+                processed_data / "podcast_20260516_cleaned_speaker_transcript.cleaned.processed_documents.json",
+                r"D:\Pod Cast RAG\podcast-host-transcription-pipeline\output\podcast 20260516_cleaned_speaker_transcript.json",
                 "cleanfingerprint",
                 "Federal Reserve",
                 "The Fed is boxed in.",
@@ -256,8 +256,8 @@ class TopicIndexTests(unittest.TestCase):
                 topic_contribution_dir="state/topic_contributions",
                 topic_index_path="state/topic_index.json",
                 topic_index_manifest_path="state/topic_index_manifest.json",
-                podcast_id="tfm",
-                podcast_name="TFM",
+                podcast_id="podcast",
+                podcast_name="Podcast",
             )
 
             refresh_topic_index(config, root)

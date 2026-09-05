@@ -37,7 +37,22 @@ def extract_episode_metadata(payload: Any, path: Path) -> dict[str, Any]:
         or parse_episode_date(first_present(nested, ["episode_date", "show_date", "recording_date", "published_date", "date"]))
         or parse_episode_date(path.name)
     )
+    partition = nested.get("partition") if isinstance(nested.get("partition"), dict) else source.get("partition")
+    partition = partition if isinstance(partition, dict) else {}
+    partition_id = (
+        first_present(source, ["partition_id"])
+        or first_present(nested, ["partition_id"])
+        or first_present(partition, ["partition_id"])
+    )
+    episode_id = (
+        first_present(source, ["episode_id"])
+        or first_present(nested, ["episode_id"])
+        or path.stem
+    )
     return {
+        "episode_id": episode_id,
+        "episode_uid": first_present(source, ["episode_uid"])
+        or first_present(nested, ["episode_uid"]),
         "episode_date": episode_date,
         "episode_date_compact": first_present(source, ["episode_date_compact"])
         or first_present(nested, ["episode_date_compact"])
@@ -45,6 +60,78 @@ def extract_episode_metadata(payload: Any, path: Path) -> dict[str, Any]:
         "episode_sort_key": first_present(source, ["episode_sort_key"])
         or first_present(nested, ["episode_sort_key"])
         or episode_sort_key(episode_date),
+        "partition_id": partition_id,
+        "corpus_id": partition_id
+        or first_present(source, ["corpus_id"])
+        or first_present(nested, ["corpus_id"])
+        or first_present(partition, ["corpus_id"]),
+        "partition_display_name": first_present(source, ["partition_display_name"])
+        or first_present(nested, ["partition_display_name"])
+        or first_present(partition, ["partition_display_name"]),
+        "context_type": first_present(source, ["context_type"])
+        or first_present(nested, ["context_type"])
+        or first_present(partition, ["context_type"]),
+        "workflow_profile": first_present(source, ["workflow_profile"])
+        or first_present(nested, ["workflow_profile"])
+        or first_present(partition, ["workflow_profile"]),
+        "partition_config_fingerprint": first_present(source, ["partition_config_fingerprint"])
+        or first_present(nested, ["partition_config_fingerprint"])
+        or first_present(partition, ["partition_config_fingerprint"]),
+        "correction_set_id": first_present(source, ["correction_set_id"])
+        or first_present(nested, ["correction_set_id"]),
+        "selected_variant": first_present(source, ["text_version", "selected_variant"])
+        or first_present(nested, ["text_version", "selected_variant"]),
+        "source_audio_fingerprint": first_present(source, ["source_audio_fingerprint"])
+        or first_present(nested, ["source_audio_fingerprint"]),
+    }
+
+
+def partition_scope(files: list[Path]) -> dict[str, Any]:
+    """Inspect a transcript root and require one processing-space identity."""
+    identities: dict[str, dict[str, Any]] = {}
+    legacy_files: list[str] = []
+    errors: list[str] = []
+    for path in files:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            # Leave malformed input for the per-file validation/errata boundary;
+            # it has no partition identity that could create a false scope mix.
+            legacy_files.append(str(path))
+            continue
+        metadata = extract_episode_metadata(payload, path)
+        identity = {
+            key: metadata[key]
+            for key in (
+                "episode_id",
+                "episode_uid",
+                "partition_id",
+                "corpus_id",
+                "partition_display_name",
+                "context_type",
+                "workflow_profile",
+                "partition_config_fingerprint",
+                "correction_set_id",
+                "selected_variant",
+                "source_audio_fingerprint",
+            )
+            if metadata.get(key) not in (None, "")
+        }
+        key = str(identity.get("partition_id") or identity.get("corpus_id") or "")
+        if key:
+            identities.setdefault(key, identity)
+        else:
+            legacy_files.append(str(path))
+    if len(identities) > 1:
+        errors.append("transcript input contains multiple processing spaces: " + ", ".join(sorted(identities)))
+    if identities and legacy_files:
+        errors.append("transcript input mixes partition-aware and legacy files: " + ", ".join(legacy_files[:5]))
+    return {
+        "valid": not errors,
+        "partition": next(iter(identities.values()), {}),
+        "partition_ids": sorted(identities),
+        "legacy_file_count": len(legacy_files),
+        "errors": errors,
     }
 
 def load_transcript_json(path: Path) -> list[Document]:
@@ -64,12 +151,14 @@ def load_transcript_json(path: Path) -> list[Document]:
         record_episode_date = parse_episode_date(first_present(record, ["episode_date", "show_date", "recording_date", "published_date", "date"]))
         speaker = primary_speaker_from_record(record)
         metadata = {
+            **episode_metadata,
             "source": str(path),
             "level": "leaf",
             "start_time": safe_float(first_present(record, ["start", "start_time", "timestamp_start"])),
             "end_time": safe_float(first_present(record, ["end", "end_time", "timestamp_end"])),
             "speaker": speaker,
             "segment_index": first_present(record, ["id", "segment_id", "seek"]) or idx,
+            "source_segment_id": first_present(record, ["source_span_id", "segment_id", "id"]) or f"{episode_metadata['episode_id']}:segment:{idx}",
             "source_type": "json_transcript",
             "episode_date": record_episode_date or episode_metadata["episode_date"],
             "episode_date_compact": first_present(record, ["episode_date_compact"]) or episode_metadata["episode_date_compact"],
@@ -86,6 +175,7 @@ def load_transcript_json(path: Path) -> list[Document]:
             Document(
                 page_content=str(fallback_text).strip(),
                 metadata={
+                    **episode_metadata,
                     "source": str(path),
                     "level": "leaf",
                     "start_time": None,

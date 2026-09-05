@@ -17,8 +17,7 @@ class UpstreamContractError(ValueError):
     pass
 
 
-def parse_episode_contract(path: str | Path) -> dict[str, Any]:
-    value = json.loads(Path(path).read_text(encoding="utf-8"))
+def parse_episode_contract_payload(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise UpstreamContractError("episode contract must be an object")
     version = str(value.get("contract_version") or value.get("schema_version") or "")
@@ -59,6 +58,11 @@ def parse_episode_contract(path: str | Path) -> dict[str, Any]:
     return result
 
 
+def parse_episode_contract(path: str | Path) -> dict[str, Any]:
+    value = json.loads(Path(path).read_text(encoding="utf-8"))
+    return parse_episode_contract_payload(value)
+
+
 def _canonical(value: Any) -> bytes:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
@@ -78,8 +82,7 @@ def _validate_v2_identity(manifest: Mapping[str, Any]) -> None:
         raise UpstreamContractError("correction-set identity mismatch")
 
 
-def parse_correction_fixture(path: str | Path) -> dict[str, Any]:
-    value = json.loads(Path(path).read_text(encoding="utf-8"))
+def parse_correction_fixture_payload(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise UpstreamContractError("correction payload must be an object")
     manifest = value.get("manifest", value)
@@ -99,13 +102,17 @@ def parse_correction_fixture(path: str | Path) -> dict[str, Any]:
     approved = [
         dict(item)
         for item in corrections
-        if isinstance(item, dict) and _correction_state(item) in APPROVED_CORRECTION_STATES
+        if isinstance(item, dict)
+        and _correction_state(item) in APPROVED_CORRECTION_STATES
+        and not item.get("superseded_by")
+        and not item.get("superseded")
     ]
     if transcript is not None:
         if not isinstance(transcript, dict):
             raise UpstreamContractError("transcript must be an object")
         actual = hashlib.sha256(_canonical(transcript)).hexdigest()
-        if actual != manifest.get("source_transcript_hash"):
+        expected_hash = str(manifest.get("source_transcript_hash") or "").removeprefix("sha256:")
+        if actual != expected_hash:
             raise UpstreamContractError("stale transcript hash")
         spans = {
             str(item.get("source_span_id", item.get("id", ""))): item
@@ -133,6 +140,11 @@ def parse_correction_fixture(path: str | Path) -> dict[str, Any]:
         episode_ids.add(str(transcript["episode_id"]))
     result["affected_episode_ids"] = sorted(episode_ids)
     return result
+
+
+def parse_correction_fixture(path: str | Path) -> dict[str, Any]:
+    value = json.loads(Path(path).read_text(encoding="utf-8"))
+    return parse_correction_fixture_payload(value)
 
 
 def discover_correction_notifications(project_root: str | Path) -> list[dict[str, Any]]:

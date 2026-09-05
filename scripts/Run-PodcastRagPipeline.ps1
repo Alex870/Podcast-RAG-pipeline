@@ -5,8 +5,11 @@ param(
     [string]$FileGlob,
     [string]$Model,
     [string]$BaseUrl,
+    [string]$Partition,
+    [string]$Manifest,
     [int]$MaxParallelModelRequests,
     [switch]$OneFile,
+    [switch]$Managed,
     [switch]$CreateStopFile,
     [switch]$ClearStopFile,
     [switch]$InspectCache,
@@ -183,6 +186,33 @@ if (-not $SkipDependencyCheck) {
 }
 
 $argsList = @("--config", $Config)
+
+if ($Partition -and $Manifest) {
+    Write-Error "Specify either -Partition or -Manifest, not both."
+    Exit-Script 1
+}
+
+$managedRun = $Managed -or $Partition -or $Manifest
+if ($managedRun) {
+    if ($InputDir -or $FileGlob) {
+        Write-Error "Managed partition runs do not accept -InputDir or -FileGlob. Use the partition handoff inbox instead."
+        Exit-Script 1
+    }
+
+    $argsList += "process"
+    if ($Partition) {
+        $argsList += @("--partition", $Partition)
+    } elseif ($Manifest) {
+        $argsList += @("--manifest", $Manifest)
+    }
+    if ($OneFile) {
+        $argsList += "--one-file"
+    }
+
+    $pythonArgs = @($PythonScript) + $argsList
+    Invoke-ProjectPython -Arguments $pythonArgs
+    Exit-Script $LASTEXITCODE
+}
 
 if ($InputDir) {
     $argsList += @("--input-dir", $InputDir)

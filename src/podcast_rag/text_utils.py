@@ -165,15 +165,17 @@ def extract_position_objects_from_partial_json(text: str) -> list[dict[str, Any]
         idx += end
     return positions
 
-def with_retry(func, label: str, retries: int = 3, delay: int = 1):
+def with_retry(func, label: str, retries: int = 3, delay: int = 1, on_retry=None):
     for attempt in range(retries):
         if runtime.STOP_REQUESTED:
             raise runtime.PipelineInterrupted("Stop requested before retrying a model request.")
         try:
             return func()
-        except Exception:
+        except Exception as exc:
             if attempt == retries - 1:
                 raise
+            if on_retry is not None:
+                on_retry(attempt + 1, exc)
             print(f"{label} retry {attempt + 1}")
             time.sleep(delay)
 

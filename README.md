@@ -10,6 +10,8 @@ The default workflow targets a local LM Studio server running on Windows 11 usin
 
 The shared transcript, processed-cache, Chroma metadata, and `podcast.json` expectations are documented in [`docs/podcast_pipeline_contract.md`](docs/podcast_pipeline_contract.md).
 
+Managed podcasts and work-meeting corpora use isolated processing partitions and the upstream manifest handoff described in [`docs/partition-management.md`](docs/partition-management.md) and the root [`transcription-handoff-contract.md`](transcription-handoff-contract.md).
+
 ## Clean-machine packaging
 
 The Windows environment file installs the exact direct dependency pins in `podcast_rag_requirements.txt`. Use `scripts/Test-PodcastRagEnvironment.ps1` before running delta processing, migration, or benchmarks; missing Conda or model-provider access is reported as a prerequisite diagnostic rather than hidden.

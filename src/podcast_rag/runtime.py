@@ -196,8 +196,33 @@ class RunStats:
         self.fallbacks = 0
         self.documents = 0
         self.position_cards = 0
+        self.errata_written = 0
+        self.errata_with_findings = 0
+        self.errata_errors = 0
+        self.errata_llm_requested = 0
+        self.errata_llm_completed = 0
+        self.errata_llm_failed = 0
+        self.errata_finding_codes: dict[str, int] = {}
         self.failures: list[dict[str, Any]] = []
         self.files: list[dict[str, Any]] = []
+
+    def record_errata(self, payload: dict[str, Any]) -> None:
+        self.errata_written += 1
+        findings = list(payload.get("findings") or [])
+        if findings:
+            self.errata_with_findings += 1
+        if any(str(item.get("severity")) == "error" for item in findings):
+            self.errata_errors += 1
+        diagnosis_status = str((payload.get("llm_diagnosis") or {}).get("status") or "")
+        if diagnosis_status in {"completed", "failed"}:
+            self.errata_llm_requested += 1
+        if diagnosis_status == "completed":
+            self.errata_llm_completed += 1
+        elif diagnosis_status == "failed":
+            self.errata_llm_failed += 1
+        for finding in findings:
+            code = str(finding.get("code") or "unknown")
+            self.errata_finding_codes[code] = self.errata_finding_codes.get(code, 0) + 1
 
     def snapshot(self, performance: PerformanceTracker | None = None) -> dict[str, Any]:
         payload = {
@@ -212,6 +237,13 @@ class RunStats:
             "fallbacks": self.fallbacks,
             "documents": self.documents,
             "position_cards": self.position_cards,
+            "errata_written": self.errata_written,
+            "errata_with_findings": self.errata_with_findings,
+            "errata_errors": self.errata_errors,
+            "errata_llm_requested": self.errata_llm_requested,
+            "errata_llm_completed": self.errata_llm_completed,
+            "errata_llm_failed": self.errata_llm_failed,
+            "errata_finding_codes": dict(sorted(self.errata_finding_codes.items())),
             "failures": self.failures,
             "files": self.files,
         }
@@ -272,7 +304,31 @@ class FakeChain:
 
         text = str(payload.get("text", "") or "")
         prompt_tokens = token_estimate(text)
-        if text.lstrip().startswith("{") or '"node_id"' in text:
+        if "ERRATA_REVIEW_PACKET" in text:
+            content = {
+                "summary": "Deterministic fake diagnosis for test mode.",
+                "root_causes": [
+                    {
+                        "category": "unknown",
+                        "confidence": 0.5,
+                        "finding_ids": [],
+                        "claim": "The bounded packet does not establish a single root cause.",
+                        "explanation": "Review the deterministic findings and related debug artifacts.",
+                    }
+                ],
+                "actions": [
+                    {
+                        "priority": "normal",
+                        "type": "human_review",
+                        "action": "Inspect the recorded findings and verify the affected stage.",
+                        "verification": "The finding is understood and any rerun completes validation.",
+                    }
+                ],
+                "uncertainties": ["Fake test mode does not infer causes from model behavior."],
+                "human_review_questions": ["Does the deterministic finding reproduce on a clean rerun?"],
+            }
+            output = json.dumps(content, ensure_ascii=True)
+        elif text.lstrip().startswith("{") or '"node_id"' in text:
             try:
                 first = json.loads(text.splitlines()[0])
                 node_id = first.get("node_id", "")

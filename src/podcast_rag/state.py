@@ -302,6 +302,10 @@ def write_run_reports(report_dir: Path, stats: RunStats, performance: Performanc
         f"- Documents: {payload['documents']}",
         f"- Position cards: {payload['position_cards']}",
         f"- Fallbacks: {payload['fallbacks']}",
+        f"- Errata files with findings: {payload['errata_with_findings']}",
+        f"- Errata files with errors: {payload['errata_errors']}",
+        f"- LLM diagnoses: {payload['errata_llm_completed']} completed, {payload['errata_llm_failed']} failed",
+        f"- Most frequent errata codes: {json.dumps(payload['errata_finding_codes'], sort_keys=True)}",
         f"- Requests: {payload['performance']['requests']}",
         f"- Failures: {payload['performance']['failures']}",
         f"- Max tokens: {payload['performance']['run_max_total_tokens'] or 'unknown'}",
@@ -313,7 +317,8 @@ def write_run_reports(report_dir: Path, stats: RunStats, performance: Performanc
         lines.append(
             f"- {Path(str(item.get('path', item.get('source', 'unknown')))).name}: "
             f"{item.get('status')} nodes={item.get('nodes', 0)} positions={item.get('position_cards', 0)} "
-            f"source={item.get('source', '')}"
+            f"source={item.get('source', '')} "
+            f"errata={item.get('errata_json_path', '')}"
         )
     if payload["failures"]:
         lines.extend(["", "## Failures", ""])

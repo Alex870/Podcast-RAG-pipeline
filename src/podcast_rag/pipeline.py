@@ -12,6 +12,7 @@ from typing import Any
 
 import podcast_rag.runtime as runtime
 from podcast_rag.config import PipelineConfig, config_fingerprint, generation_config_fingerprint, resolve_path
+from podcast_rag.errata import ErrataRecorder, validate_diagnosis_payload
 from podcast_rag.llm_support import extract_llm_text, extract_token_usage, serialize_llm_response
 from podcast_rag.runtime import (
     PIPELINE_VERSION,
@@ -97,7 +98,7 @@ def _refresh_runtime_symbols() -> None:
 class PodcastRagPipeline:
     """Orchestrate chunking, hierarchical summarization, and position extraction."""
 
-    def __init__(self, config: PipelineConfig, project_dir: Path, control: RuntimeControl):
+    def __init__(self, config: PipelineConfig, project_dir: Path, control: RuntimeControl, *, load_models: bool = True):
         _refresh_runtime_symbols()
         self.config = config
         self.project_dir = project_dir
@@ -107,6 +108,21 @@ class PodcastRagPipeline:
         self.performance = PerformanceTracker(config.performance_report_interval_seconds)
         self.fallback_count = 0
         self.cluster_telemetry: list[dict[str, Any]] = []
+        self.active_errata: ErrataRecorder | None = None
+        self.active_context: dict[str, Any] | None = None
+        if not load_models:
+            # Cache validation needs the lightweight Document/schema runtime,
+            # but must not load an embedding model or open an LLM chain.
+            self.embeddings = None
+            self.llm = None
+            self.leaf_splitter = None
+            self.rollup_splitter = None
+            self.prompt_manifest = {}
+            self.summary_chain = None
+            self.thesis_chain = None
+            self.position_chain = None
+            self.diagnosis_chain = None
+            return
         self.embeddings = HuggingFaceEmbeddings(model_name=config.embedding_model)
         self.llm = FakeChain() if config.fake_llm else ChatOpenAI(
             model=config.lm_studio_model,
@@ -167,6 +183,20 @@ class PodcastRagPipeline:
             "If attribution is ambiguous, skip the claim instead of guessing. Return at most 5 positions. Keep each field concise. "
             f"Return JSON only, with no markdown, no commentary, and no bullet list outside the JSON object.\n\n{{text}}{self.thinking_control_suffix()}"
         )
+        diagnosis_system = (
+            "You diagnose one podcast RAG file from a bounded deterministic review packet. "
+            "Do not invent facts or recommend automatic code changes. Distinguish model output, "
+            "pipeline logic, configuration, input data, and environment causes. Ground every root "
+            "cause in finding IDs supplied in the packet. Return strict JSON only."
+        )
+        diagnosis_user = (
+            "Analyze the bounded review packet below. Return a JSON object with exactly these keys: "
+            "summary, root_causes, actions, uncertainties, human_review_questions. "
+            "Each root_causes item must contain category, confidence, finding_ids, claim, and explanation. "
+            "Each actions item must contain priority, type, action, and verification. "
+            "Use only finding IDs from the packet; if evidence is insufficient, say so.\n\n"
+            "ERRATA_REVIEW_PACKET\n{text}"
+        )
         self.prompt_manifest = {
             "prompt_version": PROMPT_VERSION,
             "summary_system": summary_system,
@@ -175,10 +205,13 @@ class PodcastRagPipeline:
             "thesis_user": thesis_user,
             "position_system": position_system,
             "position_user": position_user,
+            "diagnosis_system": diagnosis_system,
+            "diagnosis_user": diagnosis_user,
         }
         self.summary_chain = self.make_chain(ChatPromptTemplate.from_messages([("system", summary_system), ("user", summary_user)]))
         self.thesis_chain = self.make_chain(ChatPromptTemplate.from_messages([("system", thesis_system), ("user", thesis_user)]))
         self.position_chain = self.make_chain(ChatPromptTemplate.from_messages([("system", position_system), ("user", position_user)]))
+        self.diagnosis_chain = self.make_chain(ChatPromptTemplate.from_messages([("system", diagnosis_system), ("user", diagnosis_user)]))
 
     def make_chain(self, prompt):
         if self.config.fake_llm:
@@ -190,6 +223,31 @@ class PodcastRagPipeline:
         if "qwen" in model_name:
             return "\n/no_think"
         return ""
+
+    def record_diagnostic(
+        self,
+        code: str,
+        severity: str,
+        stage: str,
+        message: str,
+        *,
+        details: Any = None,
+        node_ids: list[str] | None = None,
+        evidence_paths: list[Any] | None = None,
+        excerpts: list[str] | None = None,
+    ) -> str | None:
+        if self.active_errata is None:
+            return None
+        return self.active_errata.record(
+            code,
+            severity,
+            stage,
+            message,
+            details=details,
+            node_ids=node_ids,
+            evidence_paths=evidence_paths,
+            excerpts=excerpts,
+        )
 
     def write_llm_debug_event(
         self,
@@ -217,12 +275,128 @@ class PodcastRagPipeline:
             "response_text": response_text,
             "raw_response": serialize_llm_response(raw_response),
         }
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
         return path
+
+    def diagnose_errata(self, recorder: ErrataRecorder) -> None:
+        """Run the bounded advisory diagnosis pass without affecting file success."""
+        if not recorder.has_anomalies() and not recorder.diagnosis_requested_explicitly:
+            recorder.set_diagnosis({"status": "not_requested", "reason": "no_actionable_anomalies"})
+            return
+        if not self.config.errata_enabled or not self.config.errata_llm_on_anomaly:
+            recorder.set_diagnosis({"status": "not_requested", "reason": "diagnosis_disabled"})
+            return
+        if recorder.has_model_service_failure():
+            recorder.set_diagnosis({"status": "skipped", "reason": "model_service_unavailable"})
+            return
+
+        packet = recorder.review_packet()
+        packet_text = json.dumps(packet, ensure_ascii=True, separators=(",", ":"))
+        prompt_text = f"ERRATA_REVIEW_PACKET\n{packet_text}"
+        recorder.diagnosis_input_digest = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()
+        finding_ids = {str(item.get("finding_id")) for item in recorder.findings}
+        recorder.record(
+            "errata_diagnosis_requested",
+            "info",
+            "errata",
+            "Requested an advisory LLM diagnosis for actionable file findings.",
+            details={"finding_count": len(recorder.findings), "input_chars": len(prompt_text)},
+        )
+        response_text = ""
+        token_usage: dict[str, int] = {}
+        start = time.time()
+        try:
+            def run_and_validate():
+                nonlocal response_text, token_usage
+                raw_response = self.diagnosis_chain.invoke({"text": prompt_text})
+                token_usage = extract_token_usage(raw_response)
+                response_text = extract_llm_text(raw_response)
+                parsed = extract_json_payload(response_text)
+                errors = validate_diagnosis_payload(parsed, finding_ids)
+                if errors:
+                    raise ValueError("; ".join(errors[:8]))
+                return parsed
+
+            parsed = with_retry(
+                run_and_validate,
+                "errata diagnosis",
+                on_retry=lambda attempt, exc: recorder.record(
+                    "errata_diagnosis_retry",
+                    "warning",
+                    "errata",
+                    "The advisory diagnosis request required a retry.",
+                    details={"attempt": attempt, "error_type": type(exc).__name__, "error": str(exc)},
+                ),
+            )
+            self.performance.record_llm_result(
+                "errata diagnosis",
+                time.time() - start,
+                response_text,
+                token_usage,
+            )
+            recorder.set_diagnosis(
+                {
+                    "status": "completed",
+                    **parsed,
+                    "model": self.config.lm_studio_model,
+                    "input_digest": hashlib.sha256(prompt_text.encode("utf-8")).hexdigest(),
+                    "output_digest": hashlib.sha256(response_text.encode("utf-8")).hexdigest(),
+                    "token_usage": token_usage,
+                }
+            )
+        except Exception as exc:
+            self.performance.record_failure()
+            error_text = f"{type(exc).__name__}: {exc}"
+            debug_path = self.write_llm_debug_event(
+                label="errata diagnosis",
+                event="errata_diagnosis_failed",
+                prompt_text=prompt_text,
+                response_text=short_text(response_text, 1600),
+                error=error_text,
+            )
+            recorder.add_debug_artifact(debug_path)
+            recorder.record(
+                "errata_diagnosis_failed",
+                "warning",
+                "errata",
+                "The advisory LLM diagnosis failed or returned malformed/ungrounded JSON; file outcome is unchanged.",
+                details={"error_type": type(exc).__name__, "error": str(exc), "debug_path": str(debug_path)},
+                evidence_paths=[str(debug_path)],
+                excerpts=[short_text(response_text, 800)],
+            )
+            recorder.set_diagnosis(
+                {
+                    "status": "failed",
+                    "error": error_text,
+                    "response_excerpt": short_text(response_text, 1600),
+                    "debug_path": str(debug_path),
+                }
+            )
+
+    def build_errata_review_context(self, docs: list[Document]) -> dict[str, Any]:
+        """Build bounded node metadata and graph paths without transcript bodies."""
+        max_excerpt = int(getattr(self.config, "errata_excerpt_max_chars", 360))
+        nodes = []
+        for doc in docs[:500]:
+            metadata = dict(doc.metadata or {})
+            nodes.append(
+                {
+                    "node_id": metadata.get("node_id"),
+                    "node_type": metadata.get("node_type"),
+                    "level": metadata.get("level"),
+                    "parent_id": metadata.get("parent_id"),
+                    "child_ids": list(metadata.get("child_ids") or [])[:100],
+                    "speaker": metadata.get("speaker"),
+                    "excerpt": clip_text(doc.page_content, max_excerpt),
+                }
+            )
+        return {"nodes": nodes, "node_count": len(docs)}
 
     def invoke_llm(self, chain, text: str, label: str) -> str:
         if runtime.STOP_REQUESTED:
             raise PipelineInterrupted("Stop requested before starting another model request.")
+        diagnostic_stage = "position_extraction" if "position extraction" in label else "summarization"
         if not has_substantive_text(text):
             raise ValueError(f"{label} received empty or too-short source text.")
         prompt_tokens = token_estimate(text, self.config.prompt_token_chars_per_token)
@@ -237,6 +411,16 @@ class PodcastRagPipeline:
                 ),
             )
             print(f"  debug saved: {debug_path}")
+            if self.active_errata is not None:
+                self.active_errata.add_debug_artifact(debug_path)
+            self.record_diagnostic(
+                "context_overflow_preflight",
+                "error",
+                diagnostic_stage,
+                f"{label} exceeded the configured prompt budget before invocation.",
+                details={"prompt_tokens": prompt_tokens, "prompt_budget": self.config.prompt_token_budget},
+                evidence_paths=[str(debug_path)],
+            )
             raise ValueError(f"{label} estimated prompt tokens exceed configured prompt budget.")
 
         start = time.time()
@@ -257,6 +441,15 @@ class PodcastRagPipeline:
                         raw_response=raw_candidate,
                     )
                     print(f"  debug saved: {debug_path}")
+                    if self.active_errata is not None:
+                        self.active_errata.add_debug_artifact(debug_path)
+                    self.record_diagnostic(
+                        "llm_empty_response",
+                        "warning",
+                        diagnostic_stage,
+                        f"{label} returned an empty response during a retry attempt.",
+                        evidence_paths=[str(debug_path)],
+                    )
                     raise EmptyLLMResponse(f"{label} returned an empty response.")
                 if is_missing_context_response(candidate):
                     debug_path = self.write_llm_debug_event(
@@ -268,10 +461,29 @@ class PodcastRagPipeline:
                         raw_response=raw_candidate,
                     )
                     print(f"  debug saved: {debug_path}")
+                    if self.active_errata is not None:
+                        self.active_errata.add_debug_artifact(debug_path)
+                    self.record_diagnostic(
+                        "llm_missing_context_response",
+                        "warning",
+                        diagnostic_stage,
+                        f"{label} returned a missing-context response.",
+                        evidence_paths=[str(debug_path)],
+                    )
                     raise MissingContextResponse(f"{label} returned a missing-context response instead of a summary.")
                 return candidate
 
-            result = with_retry(run_and_validate, label)
+            result = with_retry(
+                run_and_validate,
+                label,
+                on_retry=lambda attempt, exc: self.record_diagnostic(
+                    "llm_retry",
+                    "warning",
+                    diagnostic_stage,
+                    f"{label} required a retry before succeeding or falling back.",
+                    details={"attempt": attempt, "error_type": type(exc).__name__, "error": str(exc)},
+                ),
+            )
         except EmptyLLMResponse:
             self.performance.record_failure()
             if "position extraction" in label:
@@ -288,6 +500,15 @@ class PodcastRagPipeline:
                 error="All retries returned empty assistant message content.",
             )
             print(f"  debug saved: {debug_path}")
+            if self.active_errata is not None:
+                self.active_errata.add_debug_artifact(debug_path)
+            self.record_diagnostic(
+                "llm_empty_response_fallback",
+                "warning",
+                diagnostic_stage,
+                f"{label} used a fallback after all retries returned empty responses.",
+                evidence_paths=[str(debug_path)],
+            )
         except MissingContextResponse:
             self.performance.record_failure()
             if "position extraction" in label:
@@ -304,6 +525,15 @@ class PodcastRagPipeline:
                 error="All retries returned missing-context responses.",
             )
             print(f"  debug saved: {debug_path}")
+            if self.active_errata is not None:
+                self.active_errata.add_debug_artifact(debug_path)
+            self.record_diagnostic(
+                "llm_missing_context_fallback",
+                "warning",
+                diagnostic_stage,
+                f"{label} used a fallback after all retries returned missing-context responses.",
+                evidence_paths=[str(debug_path)],
+            )
         except Exception as exc:
             self.performance.record_failure()
             error_text = f"{type(exc).__name__}: {exc}"
@@ -314,6 +544,20 @@ class PodcastRagPipeline:
                 error=error_text,
             )
             print(f"  debug saved: {debug_path}")
+            if self.active_errata is not None:
+                self.active_errata.add_debug_artifact(debug_path)
+            service_failure = isinstance(exc, (ConnectionError, TimeoutError)) or any(
+                token in str(exc).lower()
+                for token in ("connection", "connect", "refused", "unavailable", "timed out")
+            )
+            self.record_diagnostic(
+                "llm_service_unavailable" if service_failure else "llm_request_failed",
+                "error" if service_failure else "warning",
+                diagnostic_stage,
+                f"{label} raised an exception after retries.",
+                details={"error_type": type(exc).__name__, "error": error_text},
+                evidence_paths=[str(debug_path)],
+            )
             if "position extraction" in label:
                 print(f"  {label} failed after retries; using empty position list. error={error_text}")
                 return '{"positions": []}'
@@ -327,7 +571,7 @@ class PodcastRagPipeline:
     def normalize_doc(self, doc: Document, source: str, index: int) -> Document:
         metadata = dict(doc.metadata or {})
         metadata["source"] = source
-        metadata["episode_id"] = stable_episode_id(source)
+        metadata["episode_id"] = metadata.get("episode_id") or stable_episode_id(source)
         metadata["episode_title"] = metadata.get("episode_title") or episode_title_from_source(source)
         metadata["source_type"] = metadata.get("source_type") or "json_transcript"
         metadata["segment_index"] = metadata.get("segment_index", index)
@@ -611,6 +855,13 @@ class PodcastRagPipeline:
                     reduced = umap.UMAP(n_components=n_components, random_state=42, metric="cosine").fit_transform(embeds)
                 except Exception as exc:
                     print(f"UMAP reduction unavailable ({type(exc).__name__}: {exc}); falling back to PCA.")
+                    self.record_diagnostic(
+                        "clustering_reduction_fallback",
+                        "warning",
+                        "hierarchy",
+                        "UMAP reduction was unavailable; PCA was used for clustering.",
+                        details={"error_type": type(exc).__name__, "error": str(exc)},
+                    )
                     reduced = PCA(n_components=n_components, random_state=42).fit_transform(embeds)
             else:
                 reduced = PCA(n_components=n_components, random_state=42).fit_transform(embeds)
@@ -629,6 +880,13 @@ class PodcastRagPipeline:
 
         if len(clusters) > self.config.max_clusters:
             print(f"Too many clusters ({len(clusters)}), using fallback grouping")
+            self.record_diagnostic(
+                "fallback_grouping_used",
+                "warning",
+                "hierarchy",
+                "The cluster count exceeded the configured maximum; deterministic fallback grouping was used.",
+                details={"cluster_count": len(clusters), "max_clusters": self.config.max_clusters, "group_size": self.config.group_fallback_size},
+            )
             clusters = {
                 f"fallback_{i}": documents[i : i + self.config.group_fallback_size]
                 for i in range(0, len(documents), self.config.group_fallback_size)
@@ -695,6 +953,17 @@ class PodcastRagPipeline:
                 **self.evidence_metadata(docs),
             },
         )
+
+        if summary_doc.metadata.get("fallback_generated"):
+            self.record_diagnostic(
+                "fallback_summary_generated",
+                "warning",
+                "summarization",
+                "A deterministic fallback summary was generated after model output could not be used.",
+                node_ids=[node_id],
+                details={"summary_generation": summary_doc.metadata.get("summary_generation")},
+                excerpts=[short_text(summary, getattr(self.config, "errata_excerpt_max_chars", 360))],
+            )
 
         for doc in docs:
             doc.metadata["parent_id"] = node_id
@@ -871,6 +1140,80 @@ class PodcastRagPipeline:
             batches.append(current)
         return batches
 
+    @staticmethod
+    def normalize_position_evidence_ids(value: Any, known_node_ids: set[str]) -> list[str]:
+        """Keep known position evidence IDs once, preserving model order."""
+        result = []
+        seen = set()
+        for node_id in coerce_string_list(value):
+            if node_id in known_node_ids and node_id not in seen:
+                seen.add(node_id)
+                result.append(node_id)
+        return result
+
+    @classmethod
+    def sanitize_position_documents(
+        cls, position_docs: list[Document], known_node_ids: set[str]
+    ) -> list[Document]:
+        """Normalize checkpointed position evidence without invoking the LLM."""
+        sanitized = []
+        for doc in position_docs:
+            if doc.metadata.get("node_type") == "position_card":
+                evidence_ids = cls.normalize_position_evidence_ids(
+                    doc.metadata.get("child_ids"), known_node_ids
+                )
+                if not evidence_ids:
+                    continue
+                doc.metadata["child_ids"] = evidence_ids
+            sanitized.append(doc)
+        return sanitized
+
+    def sanitize_position_documents_with_diagnostics(
+        self, position_docs: list[Document], known_node_ids: set[str]
+    ) -> list[Document]:
+        """Apply checkpoint normalization and record what was discarded."""
+        sanitized = []
+        for doc in position_docs:
+            if doc.metadata.get("node_type") != "position_card":
+                sanitized.append(doc)
+                continue
+            raw_ids = coerce_string_list(doc.metadata.get("child_ids"))
+            evidence_ids = self.normalize_position_evidence_ids(raw_ids, known_node_ids)
+            duplicate_count = len(raw_ids) - len(set(raw_ids))
+            unknown_ids = [node_id for node_id in raw_ids if node_id not in known_node_ids]
+            node_id = str(doc.metadata.get("node_id") or "")
+            if duplicate_count:
+                self.record_diagnostic(
+                    "duplicate_evidence_ids_removed",
+                    "warning",
+                    "checkpoint_positions",
+                    "Duplicate evidence IDs were removed while loading a position checkpoint.",
+                    details={"count": duplicate_count, "original_ids": raw_ids},
+                    node_ids=[node_id] if node_id else None,
+                )
+            if unknown_ids:
+                self.record_diagnostic(
+                    "unknown_evidence_ids_discarded",
+                    "warning",
+                    "checkpoint_positions",
+                    "Unknown evidence IDs were discarded while loading a position checkpoint.",
+                    details={"unknown_ids": unknown_ids, "known_count": len(known_node_ids)},
+                    node_ids=[node_id] if node_id else None,
+                )
+            if not evidence_ids:
+                self.record_diagnostic(
+                    "position_quarantined_orphaned_evidence",
+                    "warning",
+                    "checkpoint_positions",
+                    "A checkpointed position card was skipped because no known evidence remained.",
+                    details={"original_evidence_ids": raw_ids},
+                    node_ids=[node_id] if node_id else None,
+                )
+                continue
+            doc.metadata["child_ids"] = evidence_ids
+            sanitized.append(doc)
+        return sanitized
+
     def parse_position_payload(self, raw: str, label: str) -> list[dict[str, Any]]:
         payload = extract_json_payload(raw)
         positions = payload.get("positions") if isinstance(payload, dict) else payload
@@ -885,6 +1228,14 @@ class PodcastRagPipeline:
             partial_positions = extract_position_objects_from_partial_json(raw)
             if partial_positions:
                 print(f"{label} returned truncated JSON; recovered {len(partial_positions)} complete position object(s)")
+                self.record_diagnostic(
+                    "truncated_json_recovered",
+                    "warning",
+                    "position_extraction",
+                    f"{label} returned truncated JSON; complete position objects were recovered.",
+                    details={"recovered_count": len(partial_positions), "raw_char_count": len(raw or "")},
+                    excerpts=[short_text(raw, 800)],
+                )
                 return partial_positions
             print(f"{label} returned non-list payload; skipping")
             debug_path = self.write_llm_debug_event(
@@ -895,6 +1246,17 @@ class PodcastRagPipeline:
                 error=f"Could not parse a list of positions from model response. Parsed payload type={type(payload).__name__}.",
             )
             print(f"  debug saved: {debug_path}")
+            if self.active_errata is not None:
+                self.active_errata.add_debug_artifact(debug_path)
+            self.record_diagnostic(
+                "position_payload_not_list",
+                "warning",
+                "position_extraction",
+                f"{label} returned a payload without a usable positions array.",
+                details={"parsed_payload_type": type(payload).__name__},
+                evidence_paths=[str(debug_path)],
+                excerpts=[short_text(raw, 800)],
+            )
             return []
         return [position for position in positions if isinstance(position, dict) and position.get("claim")]
 
@@ -902,6 +1264,7 @@ class PodcastRagPipeline:
         source_docs = self.build_position_source_docs(all_nodes, thesis_doc)
         batches = self.build_position_batches(source_docs)
         node_lookup = {doc.metadata.get("node_id"): doc for doc in all_nodes if doc.metadata.get("node_id")}
+        known_node_ids = set(node_lookup)
 
         positions = []
         for batch_idx, batch in enumerate(batches, 1):
@@ -923,8 +1286,30 @@ class PodcastRagPipeline:
             counterpoints = coerce_text(position.get("counterpoints"))
             stance_category = coerce_text(position.get("stance_category")) or "unspecified"
             confidence = coerce_text(position.get("confidence")) or "unknown"
-            evidence_ids = coerce_string_list(position.get("evidence_node_ids"))
-            evidence_ids = [node_id for node_id in evidence_ids if node_id in node_lookup]
+            raw_evidence_ids = coerce_string_list(position.get("evidence_node_ids"))
+            evidence_ids = self.normalize_position_evidence_ids(
+                raw_evidence_ids, known_node_ids
+            )
+            duplicate_count = len(raw_evidence_ids) - len(set(raw_evidence_ids))
+            unknown_ids = [node_id for node_id in raw_evidence_ids if node_id not in known_node_ids]
+            if duplicate_count:
+                self.record_diagnostic(
+                    "duplicate_evidence_ids_removed",
+                    "warning",
+                    "position_extraction",
+                    "Duplicate evidence IDs were removed from a model-generated position.",
+                    details={"count": duplicate_count, "original_ids": raw_evidence_ids},
+                    node_ids=evidence_ids,
+                )
+            if unknown_ids:
+                self.record_diagnostic(
+                    "unknown_evidence_ids_discarded",
+                    "warning",
+                    "position_extraction",
+                    "Unknown evidence IDs were discarded from a model-generated position.",
+                    details={"unknown_ids": unknown_ids, "known_count": len(known_node_ids)},
+                    node_ids=evidence_ids,
+                )
             evidence_docs = [node_lookup[node_id] for node_id in evidence_ids]
             evidence_times = coerce_string_list(position.get("evidence_timestamps"))
             keywords = coerce_string_list(position.get("keywords"))
@@ -935,24 +1320,43 @@ class PodcastRagPipeline:
             episode_date = parse_episode_date(position.get("episode_date")) or thesis_meta.get("episode_date")
             position_speaker = coerce_text(position.get("speaker")) or "unknown"
             if position_speaker.lower() in {"unknown", "unclear", "ambiguous", "multiple", "mixed"}:
-                self.write_llm_debug_event(
+                self.record_diagnostic(
+                    "position_quarantined_ambiguous_speaker",
+                    "warning",
+                    "position_extraction",
+                    "A model-generated position was skipped because its speaker attribution was ambiguous.",
+                    details={"speaker": position_speaker, "claim": claim},
+                    node_ids=evidence_ids,
+                )
+                debug_path = self.write_llm_debug_event(
                     label="position extraction",
                     event="position_quarantined_ambiguous_speaker",
                     prompt_text="",
                     response_text=json.dumps(position, ensure_ascii=True, default=str),
                     error="Structured position did not contain an attributable single speaker.",
                 )
+                if self.active_errata is not None:
+                    self.active_errata.add_debug_artifact(debug_path)
                 continue
             if not claim:
                 continue
             if not evidence_docs:
-                self.write_llm_debug_event(
+                self.record_diagnostic(
+                    "position_quarantined_orphaned_evidence",
+                    "warning",
+                    "position_extraction",
+                    "A model-generated position was skipped because it had no known evidence nodes.",
+                    details={"original_evidence_ids": raw_evidence_ids},
+                )
+                debug_path = self.write_llm_debug_event(
                     label="position extraction",
                     event="position_quarantined_orphaned_evidence",
                     prompt_text="",
                     response_text=json.dumps(position, ensure_ascii=True, default=str),
                     error="Structured position referenced no known evidence node.",
                 )
+                if self.active_errata is not None:
+                    self.active_errata.add_debug_artifact(debug_path)
                 continue
             evidence_excerpt = " ".join(clip_text(doc.page_content, self.config.position_quote_excerpt_chars) for doc in evidence_docs[:3])
             position_key = (
@@ -1042,8 +1446,26 @@ class PodcastRagPipeline:
             preview = "; ".join(bad[:10])
             if len(bad) > 10:
                 preview += f"; and {len(bad) - 10} more"
+            self.record_diagnostic(
+                "document_validation_failed",
+                "error",
+                "validation",
+                "Document-level validation failed before cache creation.",
+                details={"errors": bad[:100], "error_count": len(bad)},
+                node_ids=[str(doc.metadata.get("node_id")) for doc in docs if doc.metadata.get("node_id")][:100],
+            )
             raise ValueError(f"{label} produced invalid documents: {preview}")
         result = validate_processed_documents(docs, require_provenance=True)
+        if result.errors:
+            self.record_diagnostic(
+                "structural_validation_failed",
+                "error",
+                "validation",
+                "Processed documents failed structural or provenance validation.",
+                details={"errors": result.errors[:100], "issues": result.issues[:100]},
+                node_ids=[str(issue_node) for issue in result.issues for issue_node in issue.get("node_ids", [])][:100],
+                evidence_paths=[path for issue in result.issues for path in issue.get("evidence_paths", [])][:50],
+            )
         result.raise_for_errors(label)
         for warning in result.warnings[:5]:
             print(f"  cache validation warning: {warning}")
@@ -1062,8 +1484,9 @@ class PodcastRagPipeline:
             )
         return docs
 
-    def save_cached_documents(self, cache_path: Path, source_path: Path, fingerprint: str, docs: list[Document]) -> None:
+    def save_cached_documents(self, cache_path: Path, source_path: Path, fingerprint: str, docs: list[Document], context: dict[str, Any] | None = None) -> None:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
+        self._apply_active_context(docs, context or getattr(self, "active_context", None) or {})
         self.validate_documents_before_cache(docs, f"cache write {cache_path}")
         validation = validate_processed_documents(docs)
         representation_builder = RepresentationBuilder(
@@ -1071,22 +1494,52 @@ class PodcastRagPipeline:
             lexical_text_mode=self.config.lexical_text_mode,
             contextual_header_max_chars=self.config.contextual_header_max_chars,
         )
+        active_context = context or getattr(self, "active_context", None) or {}
+        cache_source_path = str(active_context.get("selected_transcript_relative_path") or source_path)
+        source_artifact_hash = hashlib.sha256(source_path.read_bytes()).hexdigest()
+        identity_fields = {
+            key: active_context.get(key)
+            for key in (
+                "partition_id",
+                "corpus_id",
+                "partition_display_name",
+                "context_type",
+                "workflow_profile",
+                "partition_config_fingerprint",
+                "handoff_id",
+                "episode_id",
+                "episode_uid",
+                "correction_set_id",
+                "selected_variant",
+                "selected_transcript_relative_path",
+                "selected_transcript_artifact_sha256",
+                "selected_transcript_canonical_payload_sha256",
+                "source_audio_fingerprint",
+            )
+            if active_context.get(key) not in (None, "")
+        }
+        representation_manifest = representation_builder.manifest()
         payload = {
             "version": 2,
             "schema_version": self.config.cache_schema_version,
             "pipeline_version": PIPELINE_VERSION,
             "prompt_version": PROMPT_VERSION,
             "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-            "source_path": str(source_path),
+            "source_path": cache_source_path,
             "source_fingerprint": fingerprint,
-            "source_transcript_hash": hashlib.sha256(source_path.read_bytes()).hexdigest(),
+            "cache_key": fingerprint,
+            "source_transcript_hash": source_artifact_hash,
+            "source_artifact_sha256": active_context.get("selected_transcript_artifact_sha256") or source_artifact_hash,
+            "canonical_payload_sha256": active_context.get("selected_transcript_canonical_payload_sha256"),
             "source_schema_version": source_schema_version(source_path),
             "stable_source_id": stable_episode_id(fingerprint),
+            **identity_fields,
             "config_fingerprint": config_fingerprint(self.config),
             "generation_config_fingerprint": generation_config_fingerprint(self.config),
+            "representation_config_fingerprint": representation_manifest.get("config_fingerprint"),
             "model": self.config.lm_studio_model,
             "embedding_model": self.config.embedding_model,
-            "representations": representation_builder.manifest(),
+            "representations": representation_manifest,
             "prompt_manifest": self.prompt_manifest,
             "token_maxima": self.performance.snapshot(),
             "fallback_count": self.fallback_count,
@@ -1101,11 +1554,15 @@ class PodcastRagPipeline:
                 "pipeline_version": PIPELINE_VERSION,
                 "prompt_version": PROMPT_VERSION,
                 "source_fingerprint": fingerprint,
-                "source_transcript_hash": hashlib.sha256(source_path.read_bytes()).hexdigest(),
+                "cache_key": fingerprint,
+                "source_transcript_hash": source_artifact_hash,
+                "source_artifact_sha256": active_context.get("selected_transcript_artifact_sha256") or source_artifact_hash,
+                "canonical_payload_sha256": active_context.get("selected_transcript_canonical_payload_sha256"),
+                **identity_fields,
                 "model": self.config.lm_studio_model,
                 "config_fingerprint": config_fingerprint(self.config),
                 "generation_config_fingerprint": generation_config_fingerprint(self.config),
-                "representations": representation_builder.manifest(),
+                "representations": representation_manifest,
             },
             "document_count": len(docs),
             "documents": document_payloads(docs, fingerprint, representation_builder),
@@ -1114,45 +1571,172 @@ class PodcastRagPipeline:
         temp_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
         temp_path.replace(cache_path)
 
-    def validate_cached_file(self, path: Path, fingerprint: str, cache_path: Path) -> dict[str, Any]:
+    def validate_cached_file(self, path: Path, fingerprint: str, cache_path: Path, context: dict[str, Any] | None = None) -> dict[str, Any]:
         print(f"\nValidating cached processed data: {cache_path}")
-        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+        try:
+            payload = json.loads(cache_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            self.record_diagnostic(
+                "cache_read_failed",
+                "error",
+                "cache_validation",
+                "The processed-data cache could not be read as JSON.",
+                details={"path": str(cache_path), "error_type": type(exc).__name__, "error": str(exc)},
+            )
+            raise
         cache_validation = validate_processed_cache(payload)
+        if cache_validation.errors:
+            self.record_diagnostic(
+                "cache_validation_structural_failure",
+                "error",
+                "cache_validation",
+                "The processed-data cache failed envelope or document validation.",
+                details={"errors": cache_validation.errors[:100], "issues": cache_validation.issues[:100]},
+                node_ids=[str(node_id) for issue in cache_validation.issues for node_id in issue.get("node_ids", [])][:100],
+                evidence_paths=[path for issue in cache_validation.issues for path in issue.get("evidence_paths", [])][:50],
+            )
         cache_validation.raise_for_errors(f"cache {cache_path}")
+        expected_context = context or getattr(self, "active_context", None) or {}
+        cache_key = payload.get("cache_key") or payload.get("source_fingerprint")
+        if cache_key != fingerprint:
+            self.record_diagnostic(
+                "cache_identity_mismatch",
+                "error",
+                "cache_validation",
+                "The processed-data cache key does not match the selected episode input.",
+                details={"expected_cache_key": fingerprint, "actual_cache_key": cache_key},
+            )
+            raise ValueError("processed cache key does not match the selected input")
+        if expected_context:
+            identity_mismatches = []
+            for key in ("partition_id", "corpus_id", "episode_uid", "handoff_id", "correction_set_id", "selected_transcript_artifact_sha256", "selected_transcript_canonical_payload_sha256"):
+                expected = expected_context.get(key)
+                if expected not in (None, "") and payload.get(key) != expected:
+                    identity_mismatches.append({"field": key, "expected": expected, "actual": payload.get(key)})
+            if identity_mismatches:
+                self.record_diagnostic(
+                    "cache_identity_mismatch",
+                    "error",
+                    "cache_validation",
+                    "The processed-data cache belongs to a different handoff or processing partition.",
+                    details={"mismatches": identity_mismatches},
+                )
+                raise ValueError("processed cache identity does not match the selected handoff")
         docs = self.load_cached_documents(cache_path)
         if not docs:
             raise RuntimeError(f"Processed data cache was empty: {cache_path}")
         self.validate_documents_before_cache(docs, f"cache {cache_path}")
         print(f"  Cached processed data is valid for {path}: {len(docs)} documents")
+        first_metadata = dict(docs[0].metadata or {})
+        node_type_counts = {}
+        for doc in docs:
+            node_type = str(doc.metadata.get("node_type") or "unknown")
+            node_type_counts[node_type] = node_type_counts.get(node_type, 0) + 1
         return {
             "status": "completed",
             "source": "processed_data_cache",
             "nodes": len(docs),
             "cache_path": str(cache_path),
+            "episode_id": first_metadata.get("episode_id"),
+            "episode_title": first_metadata.get("episode_title"),
+            "episode_date": first_metadata.get("episode_date"),
+            "source_type": first_metadata.get("source_type"),
+            "leaf_chunks": node_type_counts.get("leaf_chunk", 0),
+            "summaries": node_type_counts.get("cluster_summary", 0),
+            "positions": node_type_counts.get("position_card", 0),
         }
 
     def load_file_checkpoint(self, source_path: Path, fingerprint: str, stage: str) -> list[Document] | None:
         if not self.config.resume_within_file:
+            if self.active_errata is not None:
+                self.active_errata.set_checkpoint_reuse(stage, False)
             return None
         path = checkpoint_path(self.config, self.project_dir, source_path, fingerprint, stage)
         if not path.exists():
+            if self.active_errata is not None:
+                self.active_errata.set_checkpoint_reuse(stage, False)
             return None
         try:
             payload = read_json_file(path)
-        except Exception:
+        except Exception as exc:
+            self.record_diagnostic(
+                "checkpoint_corrupt",
+                "warning",
+                stage,
+                f"The {stage} checkpoint could not be read and was ignored.",
+                details={"path": str(path), "error_type": type(exc).__name__, "error": str(exc)},
+            )
+            if self.active_errata is not None:
+                self.active_errata.set_checkpoint_reuse(stage, False)
+            return None
+        if not isinstance(payload, dict):
+            self.record_diagnostic(
+                "checkpoint_invalid_shape",
+                "warning",
+                stage,
+                f"The {stage} checkpoint is not a JSON object and was ignored.",
+                details={"path": str(path), "payload_type": type(payload).__name__},
+            )
+            if self.active_errata is not None:
+                self.active_errata.set_checkpoint_reuse(stage, False)
             return None
         if payload.get("source_fingerprint") != fingerprint:
+            self.record_diagnostic(
+                "checkpoint_stale",
+                "warning",
+                stage,
+                f"The {stage} checkpoint belongs to a different source fingerprint and was ignored.",
+                details={"path": str(path), "checkpoint_fingerprint": payload.get("source_fingerprint"), "expected_fingerprint": fingerprint},
+            )
+            if self.active_errata is not None:
+                self.active_errata.set_checkpoint_reuse(stage, False)
+            return None
+        active_context = getattr(self, "active_context", None) or {}
+        identity_mismatches = [
+            {"field": key, "expected": active_context.get(key), "actual": payload.get(key)}
+            for key in ("partition_id", "corpus_id", "episode_uid", "handoff_id", "correction_set_id")
+            if active_context.get(key) not in (None, "") and payload.get(key) != active_context.get(key)
+        ]
+        if identity_mismatches:
+            self.record_diagnostic(
+                "checkpoint_identity_mismatch",
+                "warning",
+                stage,
+                f"The {stage} checkpoint belongs to another handoff or partition and was ignored.",
+                details={"mismatches": identity_mismatches, "path": str(path)},
+            )
+            if self.active_errata is not None:
+                self.active_errata.set_checkpoint_reuse(stage, False)
             return None
         documents = payload.get("documents")
-        if not isinstance(documents, list):
+        if not isinstance(documents, list) or any(not isinstance(item, dict) for item in documents):
+            self.record_diagnostic(
+                "checkpoint_invalid_shape",
+                "warning",
+                stage,
+                f"The {stage} checkpoint has an invalid document array and was ignored.",
+                details={"path": str(path), "document_count": len(documents) if isinstance(documents, list) else None},
+            )
+            if self.active_errata is not None:
+                self.active_errata.set_checkpoint_reuse(stage, False)
             return None
         print(f"  checkpoint reused: {stage} ({len(documents)} document(s))")
+        if self.active_errata is not None:
+            self.active_errata.set_checkpoint_reuse(stage, True)
+        self.record_diagnostic(
+            "checkpoint_reused",
+            "info",
+            stage,
+            f"Reused the {stage} checkpoint.",
+            details={"path": str(path), "document_count": len(documents)},
+        )
         return docs_from_payloads(documents)
 
     def save_file_checkpoint(self, source_path: Path, fingerprint: str, stage: str, docs: list[Document]) -> None:
         if not self.config.resume_within_file:
             return
         path = checkpoint_path(self.config, self.project_dir, source_path, fingerprint, stage)
+        active_context = getattr(self, "active_context", None) or {}
         write_json_file(
             path,
             {
@@ -1160,6 +1744,11 @@ class PodcastRagPipeline:
                 "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
                 "source_path": str(source_path),
                 "source_fingerprint": fingerprint,
+                **{
+                    key: active_context[key]
+                    for key in ("partition_id", "corpus_id", "handoff_id", "episode_id", "episode_uid", "correction_set_id", "selected_variant", "selected_transcript_artifact_sha256", "selected_transcript_canonical_payload_sha256", "source_audio_fingerprint")
+                    if active_context.get(key) not in (None, "")
+                },
                 "documents": document_payloads(docs, fingerprint),
             },
         )
@@ -1172,21 +1761,136 @@ class PodcastRagPipeline:
             if path.exists():
                 path.unlink()
 
-    def process_file(self, path: Path) -> dict[str, Any]:
+    def process_file(
+        self, path: Path, errata: ErrataRecorder | None = None, context: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        previous_errata = self.active_errata
+        previous_context = getattr(self, "active_context", None)
+        self.active_errata = errata
+        self.active_context = context
+        try:
+            return self._process_file(path)
+        except PipelineInterrupted as exc:
+            self.record_diagnostic(
+                "file_interrupted",
+                "error",
+                "file",
+                "File processing was interrupted before completion.",
+                details={"error": str(exc)},
+            )
+            raise
+        except Exception as exc:
+            self.record_diagnostic(
+                "file_exception",
+                "error",
+                "file",
+                "File processing raised an exception before completion.",
+                details={"error_type": type(exc).__name__, "error": str(exc)},
+            )
+            raise
+        finally:
+            self.active_errata = previous_errata
+            self.active_context = previous_context
+
+    @staticmethod
+    def _apply_active_context(docs: list[Document], context: dict[str, Any]) -> None:
+        """Carry managed handoff identity onto every derived document."""
+        if not context:
+            return
+        identity_keys = (
+            "partition_id",
+            "corpus_id",
+            "partition_display_name",
+            "context_type",
+            "workflow_profile",
+            "partition_config_fingerprint",
+            "handoff_id",
+            "episode_uid",
+            "correction_set_id",
+            "selected_variant",
+            "source_audio_fingerprint",
+        )
+        for doc in docs:
+            for key in identity_keys:
+                if context.get(key) not in (None, ""):
+                    doc.metadata[key] = context[key]
+            if context.get("episode_id"):
+                doc.metadata["episode_id"] = context["episode_id"]
+            if context.get("episode_title"):
+                doc.metadata["episode_title"] = context["episode_title"]
+            if context.get("episode_date"):
+                doc.metadata["episode_date"] = context["episode_date"]
+
+    def _process_file(self, path: Path) -> dict[str, Any]:
         """Build or resume all retrieval artifacts for a single transcript file."""
         source = str(path)
-        fingerprint = file_fingerprint(path)
+        active_context = getattr(self, "active_context", None) or {}
+        fingerprint = str(active_context.get("processing_key") or file_fingerprint(path))
         print(f"\nProcessing: {source}")
         self.performance.start_file(source)
         docs = load_transcript_json(path)
+        if active_context:
+            for doc in docs:
+                for key in (
+                    "partition_id",
+                    "corpus_id",
+                    "partition_display_name",
+                    "context_type",
+                    "workflow_profile",
+                    "partition_config_fingerprint",
+                    "handoff_id",
+                    "episode_uid",
+                    "correction_set_id",
+                    "selected_variant",
+                    "source_audio_fingerprint",
+                ):
+                    if active_context.get(key) not in (None, ""):
+                        doc.metadata[key] = active_context[key]
+                if active_context.get("episode_id"):
+                    doc.metadata["episode_id"] = active_context["episode_id"]
+                if active_context.get("episode_title"):
+                    doc.metadata["episode_title"] = active_context["episode_title"]
+                if active_context.get("episode_date"):
+                    doc.metadata["episode_date"] = active_context["episode_date"]
+        if self.active_errata is not None and docs:
+            first_metadata = dict(docs[0].metadata or {})
+            self.active_errata.update_source(
+                episode_id=first_metadata.get("episode_id"),
+                episode_title=first_metadata.get("episode_title"),
+                source_type=first_metadata.get("source_type"),
+                episode_date=first_metadata.get("episode_date"),
+                episode_date_compact=first_metadata.get("episode_date_compact"),
+                episode_sort_key=first_metadata.get("episode_sort_key"),
+            )
+            missing_metadata = [
+                field
+                for field in ("episode_id", "episode_title", "episode_date", "source_type")
+                if first_metadata.get(field) in (None, "")
+            ]
+            if missing_metadata:
+                self.record_diagnostic(
+                    "missing_metadata",
+                    "warning",
+                    "input",
+                    "The transcript metadata was incomplete; downstream attribution may be degraded.",
+                    details={"fields": missing_metadata},
+                )
         leaf_chunks = self.load_file_checkpoint(path, fingerprint, "leaf_chunks")
         if leaf_chunks is None:
             # Leaf chunks are deterministic, so they are the first cheap checkpoint.
             leaf_chunks = self.build_leaf_chunks(docs, source)
             self.save_file_checkpoint(path, fingerprint, "leaf_chunks", leaf_chunks)
+        if self.active_errata is not None:
+            self.active_errata.update_metrics(leaf_chunks=len(leaf_chunks))
 
         if not leaf_chunks:
             print("  No usable text found; skipping")
+            self.record_diagnostic(
+                "no_usable_text",
+                "warning",
+                "input",
+                "The transcript contained no usable text after normalization.",
+            )
             self.performance.finish_file()
             return {"status": "skipped", "nodes": 0}
 
@@ -1199,11 +1903,34 @@ class PodcastRagPipeline:
         else:
             all_nodes = hierarchy_checkpoint
             thesis_doc = next(doc for doc in all_nodes if doc.metadata.get("node_type") == "episode_thesis")
+        if self.active_errata is not None:
+            self.active_errata.update_metrics(
+                summaries=len([doc for doc in all_nodes if doc.metadata.get("node_type") == "cluster_summary"]),
+                hierarchy_documents=len(all_nodes),
+            )
         position_docs = self.load_file_checkpoint(path, fingerprint, "positions")
         if position_docs is None:
             position_docs = self.extract_positions(all_nodes, thesis_doc)
-            self.save_file_checkpoint(path, fingerprint, "positions", position_docs)
+        position_docs = self.sanitize_position_documents_with_diagnostics(
+            position_docs,
+            {
+                str(doc.metadata["node_id"])
+                for doc in all_nodes
+                if doc.metadata.get("node_id")
+            },
+        )
+        self.save_file_checkpoint(path, fingerprint, "positions", position_docs)
         all_nodes.extend(position_docs)
+        self._apply_active_context(all_nodes, active_context)
+        if self.active_errata is not None:
+            self.active_errata.update_metrics(positions=len(position_docs))
+            self.active_errata.set_review_context(self.build_errata_review_context(all_nodes))
+            self.active_errata.update_metrics(
+                leaf_chunks=len(leaf_chunks),
+                summaries=len([doc for doc in all_nodes if doc.metadata.get("node_type") == "cluster_summary"]),
+                positions=len(position_docs),
+                documents=len(all_nodes),
+            )
         self.validate_documents_before_cache(all_nodes, source)
         elapsed = dt.timedelta(seconds=int(time.time() - start))
 

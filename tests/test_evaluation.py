@@ -19,12 +19,12 @@ class EvaluationTests(unittest.TestCase):
             query="What did the speaker say?",
             category="speaker_position",
             relevance={"doc-a": 3, "doc-b": 1},
-            expected_speakers=("TFM",),
+            expected_speakers=("HOST",),
         )
         results = [
             {"document_id": "noise", "metadata": {"speaker": "Guest", "node_type": "leaf_chunk"}},
-            {"document_id": "doc-a", "metadata": {"speaker": "TFM", "node_type": "position_card"}},
-            {"document_id": "doc-b", "metadata": {"speaker": "TFM", "node_type": "leaf_chunk"}},
+            {"document_id": "doc-a", "metadata": {"speaker": "HOST", "node_type": "position_card"}},
+            {"document_id": "doc-b", "metadata": {"speaker": "HOST", "node_type": "leaf_chunk"}},
         ]
         metrics = score_query(query, results)
         self.assertEqual(metrics["recall@5"], 1.0)

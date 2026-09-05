@@ -366,10 +366,10 @@ Store versioned JSONL under `evaluation/query_sets`:
 
 ```json
 {
-  "query_id": "tfm-001",
-  "query": "What did TFM say about multipolarity?",
+  "query_id": "podcast-001",
+  "query": "What did the host say about multipolarity?",
   "category": "speaker_position",
-  "expected_speakers": ["TFM"],
+  "expected_speakers": ["HOST"],
   "date_range": null,
   "relevance": {
     "stable-doc-id-1": 3,

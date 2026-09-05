@@ -11,13 +11,25 @@ The most important gap is not the absence of a fashionable new architecture. It 
 The strongest near-term modernization path is:
 
 1. Establish an evaluation corpus with graded evidence and speaker/date constraints.
-2. Add retrieval-ready lexical fields and support dense plus sparse hybrid retrieval downstream.
+2. Use the implemented retrieval-ready lexical fields to support dense plus sparse hybrid retrieval downstream.
 3. Introduce a reranking stage in the retrieval applications.
 4. Evaluate a modern multi-function embedding model alongside the existing BGE baseline.
-5. Test contextual or late-chunked embeddings as an optional representation.
-6. Add graph retrieval only after the benchmark demonstrates a meaningful cross-episode or multi-hop gap.
+5. Test the implemented contextual-header representation, then test true late-chunked embeddings only if a contextual-reference gap remains.
+6. Promote the existing graph prototype only after the benchmark demonstrates a meaningful cross-episode or multi-hop gap.
 
 Graph-based memory, adaptive retrieval, LLM query planning, and joint ranking-generation are promising, but they have higher cost, lower determinism, and substantially greater integration complexity. They should remain experimental until simpler retrieval improvements have been measured.
+
+### Reconciled implementation status — 2026-09-05
+
+The recommendations above are now a mixture of implemented producer capabilities and uncompleted evaluation/downstream work:
+
+- Retrieval evaluation loading, ranking metrics, result capture, reporting, and campaign-bound export are implemented. The checked-in query set is still an eight-record draft with no relevance judgments, so the primary benchmark blocker remains.
+- Processed-cache schema `2.1` already emits separate display, dense, and normalized lexical text with stable representation fingerprints. Hybrid indexing, fusion, and serving remain downstream responsibilities.
+- `context-header-v1` is implemented as an opt-in deterministic representation. The advanced-retrieval prototype can emit exact late-chunk token/character alignment, but it does not produce late-chunk vectors.
+- An opt-in, release-bound `evidence-graph-1.0` producer prototype and entry gate exist. This is research scaffolding, not evidence that graph retrieval should be promoted.
+- Reranking and alternate retrieval-model indexes remain intentionally outside this preprocessing repository and must be implemented and measured in Chroma DB Import, PodCast Chat, or RAGScope.
+
+The actionable sequence, ownership boundaries, LLM-assistance limits, and exit gates are maintained in [`retrieval-modernization-action-plan.md`](retrieval-modernization-action-plan.md).
 
 ## Current Project Baseline
 
@@ -42,15 +54,15 @@ The pipeline creates retrieval documents rather than serving user queries. Sever
 
 | Capability | Current project | Research / frontier direction | Worthiness and ease of migration |
 |---|---|---|---|
-| Retrieval evaluation | Model-output checks, cache validation, telemetry, and a planned judged query set | Fine-grained retrieval and generation diagnosis using RAGChecker-style metrics, human-calibrated LLM judges, Recall@k, MRR, nDCG, attribution, and evidence coverage | **Very high worth; medium effort.** This is the prerequisite for evaluating every other migration. The roadmap already describes most of the right work. |
+| Retrieval evaluation | Implemented versioned query/result contracts, graded ranking metrics, constraint diagnostics, reports, campaign-bound exports, and a draft unjudged query template | Fine-grained retrieval and generation diagnosis using RAGChecker-style metrics, human-calibrated LLM judges, Recall@k, MRR, nDCG, attribution, and evidence coverage | **Very high worth; medium operational effort.** The software foundation exists; authoring, reviewing, and binding real private-corpus judgments is the prerequisite for every promotion decision. |
 | Hierarchical representation | RAPTOR-style recursive embedding, HDBSCAN clustering, summaries, episode theses, and parent/child links | RAPTOR and newer memory-oriented hierarchical retrieval | **Already frontier-aligned; low need to replace.** Improve retrieval policies and evaluate hierarchy levels before changing construction. |
 | Embedding model | Single-vector English `bge-large-en-v1.5` | BGE-M3 dense, learned-sparse, and multi-vector representations; newer task-trained or domain-adapted embedders | **High experimental worth; medium effort.** Dense-only replacement is easy, but sparse and multi-vector modes require importer/database/retriever changes and complete re-embedding. |
-| Chunk context | Fixed character chunks with overlap, followed by separate embedding | Late chunking and contextualized chunk embeddings that encode chunks with surrounding episode context | **Medium-high worth; medium-high effort.** Particularly relevant to pronouns and references in conversational speech, but long episode context and custom pooling complicate implementation. Benchmark before adoption. |
-| Lexical retrieval | Topic tags and metadata are produced, but the pipeline is principally dense-vector oriented | Hybrid dense plus BM25 or learned-sparse retrieval, commonly fused with reciprocal rank fusion | **Very high worth; low-medium ecosystem effort.** Proper names, episode titles, quotations, dates, and unusual terminology make podcasts unusually suitable for lexical recall. Most query-time work belongs downstream. |
+| Chunk context | Fixed source chunks plus an opt-in deterministic `context-header-v1`; a gated late-chunk alignment sidecar exists but contains no vectors | Late chunking and contextualized chunk embeddings that encode chunks with surrounding episode context | **Medium-high worth; low effort for the header experiment and medium-high effort for true late chunking.** Test the existing header first; proceed to long-context encoding and pooling only for a measured residual gap. |
+| Lexical retrieval | Schema `2.1` emits `normalized-lexical-v1` alongside display and dense text, with stable fingerprints; no query-time lexical index is owned here | Hybrid dense plus BM25 or learned-sparse retrieval, commonly fused with reciprocal rank fusion | **Very high worth; low-medium downstream effort.** The producer portion is implemented. Chroma DB Import must build the sparse index and PodCast Chat/RAGScope must fuse and evaluate results. |
 | Candidate reranking | No query-time reranker in this preprocessing project | Cross-encoder, late-interaction, or LLM-based reranking; RankRAG jointly trains ranking and generation | **Very high worth; medium downstream effort.** Usually a better first investment than graph RAG. It adds query latency but does not require rebuilding source summaries. |
 | Multi-vector retrieval | One vector per exported document in the normal downstream flow | ColBERT-style token-level late interaction or BGE-M3 multi-vector retrieval | **High potential; high effort.** Better fine-grained matching, but it increases index size and requires a retrieval engine designed for multi-vector scoring. Chroma's conventional single-vector workflow is not an ideal direct fit. |
 | Query transformation | Query interpretation is primarily handled by downstream chat prompting | Query decomposition, multi-query retrieval, HyDE, and reasoning-generated search queries | **Medium-high worth; low-medium downstream effort.** Useful for indirect worldview questions, but adds LLM latency and can distort user intent. Keep original-query retrieval in the fused candidate set. |
-| Graph retrieval | Parent/child hierarchy and topic evidence links, but no general entity/claim knowledge graph | GraphRAG, HippoRAG 2, hypergraph RAG, graph expansion, and PageRank-based associative memory | **Medium worth for cross-episode synthesis; high effort.** The source already contains useful graph edges. Begin with lightweight traversal over existing evidence links before extracting a full knowledge graph. |
+| Graph retrieval | Parent/child, episode, topic, claim-evidence, speaker, and temporal links can be packaged in an opt-in release-bound `evidence-graph-1.0` prototype | GraphRAG, HippoRAG 2, hypergraph RAG, graph expansion, and PageRank-based associative memory | **Medium worth for cross-episode synthesis; high maturation effort.** Use the existing bounded sidecar prototype only after hybrid and reranking leave a measured graph-positive gap; do not introduce a graph database without an operational need. |
 | Adaptive/agentic retrieval | Static preprocessing; retrieval policy is selected downstream | Self-RAG-style retrieval decisions, iterative retrieval, evidence-gap detection, and corrective retrieval | **Medium worth; high operational complexity.** Valuable for hard multi-hop questions, but slower, less predictable, and difficult to benchmark. Not a preprocessing priority. |
 | Structured knowledge extraction | Position cards contain claims, speaker, stance, evidence IDs, timestamps, confidence, and counterpoints | Atomic claim graphs, event extraction, contradiction graphs, and temporal knowledge graphs | **High domain worth; medium effort.** This is a natural extension of position cards and could improve viewpoint evolution queries without adopting full GraphRAG. |
 | Topic modeling | Deterministic keyword labels, optional LLM curation, aliases, depth scores, and temporal evidence | Neural topic models, embedding topic models, dynamic topic modeling, and LLM-assisted ontology induction | **Medium worth; medium effort.** Current outputs are transparent and inexpensive. Frontier methods may improve labels but can destabilize topic identity between rebuilds. |
@@ -168,7 +180,7 @@ This is relevant to podcasts because isolated utterances often contain pronouns,
 - Broader context can make neighboring chunks less distinguishable.
 - Changing embeddings requires complete database regeneration.
 
-A lower-cost precursor is to prepend a deterministic contextual header containing podcast name, episode title/date, speaker, hierarchy path, and a short parent-summary label before embedding. Store the original chunk separately for display and citation.
+A lower-cost precursor is already implemented as opt-in `context-header-v1`. It prepends deterministic podcast, episode, date, speaker, node-type, hierarchy, and topic metadata while keeping the original chunk separate for display and citation. It should be evaluated before true late chunking.
 
 ### 5. Hybrid Dense and Lexical Retrieval
 
@@ -190,7 +202,7 @@ Sources: [BGE M3-Embedding](https://arxiv.org/abs/2402.03216) and [BRIGHT benchm
 - Fusion weights and candidate counts require evaluation.
 - Duplicated hierarchy nodes can dominate both result lists unless diversity is controlled.
 
-The preprocessing project should emit normalized searchable text and lexical fields. Query execution and rank fusion should live downstream.
+The preprocessing project now emits normalized searchable text and lexical fields in schema `2.1`. Query execution, sparse indexing, and rank fusion still belong downstream.
 
 ### 6. Reranking and Late Interaction
 

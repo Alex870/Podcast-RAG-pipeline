@@ -4,7 +4,7 @@
     {"query_id": "name", "slice": "exact_term", "query": "What did Dr. Amara Voss say?"},
     {"query_id": "date", "slice": "temporal", "query": "What changed on 2026-01-17?"},
     {"query_id": "quote", "slice": "quotation", "query": "Who said exact institutions matter?"},
-    {"query_id": "acronym", "slice": "exact_term", "query": "Where was podcast discussed?"},
+    {"query_id": "acronym", "slice": "exact_term", "query": "Where was the podcast discussed?"},
     {"query_id": "theme", "slice": "semantic", "query": "How does institutional trust evolve?"},
     {"query_id": "hierarchy", "slice": "hierarchy", "query": "Which episode thesis covers policy legitimacy?"}
   ]

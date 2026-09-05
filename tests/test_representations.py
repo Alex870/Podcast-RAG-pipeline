@@ -20,7 +20,7 @@ class RepresentationTests(unittest.TestCase):
             "level": "leaf",
             "episode_title": "The Multipolar Episode",
             "episode_date": "2026-01-02",
-            "speaker": "TFM",
+            "speaker": "HOST",
             "topic_tags": ["multipolarity", "institutions"],
         }
 
@@ -32,9 +32,9 @@ class RepresentationTests(unittest.TestCase):
         self.assertTrue(first.startswith("Episode:"))
 
     def test_lexical_text_preserves_exact_terms(self):
-        text = build_lexical_text("TFM mentions BRICS.", self.metadata)
+        text = build_lexical_text("HOST mentions BRICS.", self.metadata)
         self.assertIn("BRICS", text)
-        self.assertIn("TFM", text)
+        self.assertIn("HOST", text)
         self.assertIn("2026-01-02", text)
 
     def test_builder_defaults_keep_dense_text_equal_to_page_content(self):
@@ -45,7 +45,7 @@ class RepresentationTests(unittest.TestCase):
     def test_optional_representations_do_not_change_stable_id(self):
         doc = FakeDocument("Stable source text", self.metadata)
         plain = serialize_document(doc, "source")
-        enriched = serialize_document(doc, "source", "Context\nStable source text", "Stable source text TFM")
+        enriched = serialize_document(doc, "source", "Context\nStable source text", "Stable source text HOST")
         self.assertEqual(plain["metadata"]["stable_document_id"], enriched["metadata"]["stable_document_id"])
 
     def test_representation_fingerprints_are_source_and_builder_specific(self):
