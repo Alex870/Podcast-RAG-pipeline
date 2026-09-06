@@ -305,3 +305,11 @@ The same commands also work as a module entry point after installation:
 ```powershell
 python -m podcast_rag --config .\podcast_rag_config.json
 ```
+
+For a bounded repair of one managed episode after a model-quality issue, select the episode explicitly and force only that episode to rebuild:
+
+```powershell
+python -m podcast_rag process --partition <partition-id> --episode TFM_20260425 --force-reprocess
+```
+
+The command preserves the existing cache and errata pair under the partition's `state\reprocess_backups\` directory before atomically publishing replacement output. It refuses unscoped force-reprocess requests.

@@ -25,7 +25,8 @@ _DIAGNOSIS_CATEGORIES = {
     "environment",
     "unknown",
 }
-_ACTION_TYPES = {"code", "config", "data", "rerun", "human_review"}
+DIAGNOSIS_ACTION_TYPES = ("code", "config", "data", "rerun", "human_review")
+_ACTION_TYPES = set(DIAGNOSIS_ACTION_TYPES)
 _OUTCOME_STATUSES = {"clean", "completed_with_warnings", "cached_valid", "skipped", "interrupted", "failed"}
 
 
@@ -590,7 +591,8 @@ def validate_diagnosis_payload(payload: Any, finding_ids: set[str]) -> list[str]
             errors.append(f"diagnosis action {index} must be an object")
             continue
         if action.get("type") not in _ACTION_TYPES:
-            errors.append(f"diagnosis action {index} has invalid type")
+            allowed = ", ".join(DIAGNOSIS_ACTION_TYPES)
+            errors.append(f"diagnosis action {index} has invalid type; expected one of: {allowed}")
         for field in ("priority", "action", "verification"):
             if not isinstance(action.get(field), str) or not action.get(field).strip():
                 errors.append(f"diagnosis action {index} missing {field}")

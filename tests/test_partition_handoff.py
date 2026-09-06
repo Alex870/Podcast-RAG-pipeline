@@ -157,6 +157,32 @@ class PartitionAndHandoffTests(unittest.TestCase):
             self.assertEqual("podcast-history:episode-01", context_files[0][1]["episode_uid"])
             self.assertTrue(str(spec.paths(root)["processed_data"]) in cli.effective_partition_config(PipelineConfig(), root, spec)[0].processed_data_dir)
 
+    def test_force_reprocess_requires_one_episode_and_passes_scope_to_batch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with self.assertRaisesRegex(SystemExit, "requires --episode"):
+                cli.managed_process_command(PipelineConfig(), root, ["--force-reprocess"])
+
+            registry = PartitionRegistry(root)
+            spec = registry.create(PartitionSpec("podcast-history", "Podcast History", "podcast", "podcast"))
+            package = make_package(spec.paths(root)["handoff_inbox"])
+            with patch.object(cli, "run_batch", return_value=0) as run_batch:
+                result = cli.managed_process_command(
+                    PipelineConfig(),
+                    root,
+                    [
+                        "--manifest",
+                        str(package / "manifest.json"),
+                        "--episode",
+                        "episode-01",
+                        "--force-reprocess",
+                    ],
+                )
+
+            self.assertEqual(0, result)
+            self.assertTrue(run_batch.call_args.kwargs["force_reprocess"])
+            self.assertEqual(1, len(run_batch.call_args.kwargs["input_files"]))
+
     def test_release_validation_rejects_mixed_identity(self):
         payload = {
             "release_contract_version": "podcast-rag-corpus-release-v1",

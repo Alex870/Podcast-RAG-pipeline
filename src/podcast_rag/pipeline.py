@@ -12,7 +12,7 @@ from typing import Any
 
 import podcast_rag.runtime as runtime
 from podcast_rag.config import PipelineConfig, config_fingerprint, generation_config_fingerprint, resolve_path
-from podcast_rag.errata import ErrataRecorder, validate_diagnosis_payload
+from podcast_rag.errata import DIAGNOSIS_ACTION_TYPES, ErrataRecorder, validate_diagnosis_payload
 from podcast_rag.llm_support import extract_llm_text, extract_token_usage, serialize_llm_response
 from podcast_rag.runtime import (
     PIPELINE_VERSION,
@@ -106,7 +106,10 @@ class PodcastRagPipeline:
         self.debug_output_dir = resolve_path(project_dir, config.debug_output_dir)
         self.debug_output_dir.mkdir(parents=True, exist_ok=True)
         self.performance = PerformanceTracker(config.performance_report_interval_seconds)
+        # Keep the run total for aggregate reporting, but track the current
+        # file separately so per-file result and cache metadata stay isolated.
         self.fallback_count = 0
+        self._file_fallback_count = 0
         self.cluster_telemetry: list[dict[str, Any]] = []
         self.active_errata: ErrataRecorder | None = None
         self.active_context: dict[str, Any] | None = None
@@ -145,7 +148,10 @@ class PodcastRagPipeline:
             "You create retrieval-oriented summaries for a long-form podcast knowledge base. "
             f"Objective: {config.summary_objective}. Emphasize durable beliefs, recurring arguments, values, "
             "causal explanations, disagreements, speaker attribution, episode date, and the context needed "
-            "to answer future questions accurately. Avoid filler. Return a non-empty final answer in the assistant "
+            "to answer future questions accurately. Episode dates are historical source metadata, not deadlines "
+            "or scheduling signals; never refuse or defer summarization because a date appears earlier or later "
+            "than today's date. The source material is already present. Avoid filler. Return a non-empty final "
+            "answer in the assistant "
             "message content. Do not ask for more source text."
         )
         summary_user = (
@@ -194,6 +200,8 @@ class PodcastRagPipeline:
             "summary, root_causes, actions, uncertainties, human_review_questions. "
             "Each root_causes item must contain category, confidence, finding_ids, claim, and explanation. "
             "Each actions item must contain priority, type, action, and verification. "
+            f"The action type must be exactly one of: {', '.join(DIAGNOSIS_ACTION_TYPES)}. "
+            "Use human_review when uncertain. "
             "Use only finding IDs from the packet; if evidence is insufficient, say so.\n\n"
             "ERRATA_REVIEW_PACKET\n{text}"
         )
@@ -331,29 +339,57 @@ class PodcastRagPipeline:
         )
         response_text = ""
         token_usage: dict[str, int] = {}
+        diagnosis_validation_details: dict[str, Any] = {}
+        attempt_prompt_text = prompt_text
         start = time.time()
         try:
             def run_and_validate():
                 nonlocal response_text, token_usage
-                raw_response = self.diagnosis_chain.invoke({"text": prompt_text})
+                raw_response = self.diagnosis_chain.invoke({"text": attempt_prompt_text})
                 token_usage = extract_token_usage(raw_response)
                 response_text = extract_llm_text(raw_response)
                 parsed = extract_json_payload(response_text)
                 errors = validate_diagnosis_payload(parsed, finding_ids)
                 if errors:
+                    actions = parsed.get("actions") if isinstance(parsed, dict) else []
+                    diagnosis_validation_details["validation_errors"] = errors[:8]
+                    diagnosis_validation_details["invalid_action_types"] = [
+                        {
+                            "index": index,
+                            "value": short_text(str(action.get("type")), 120),
+                        }
+                        for index, action in enumerate(actions or [])
+                        if isinstance(action, dict) and action.get("type") not in DIAGNOSIS_ACTION_TYPES
+                    ]
                     raise ValueError("; ".join(errors[:8]))
                 return parsed
 
-            parsed = with_retry(
-                run_and_validate,
-                "errata diagnosis",
-                on_retry=lambda attempt, exc: recorder.record(
+            def on_retry(attempt, exc):
+                nonlocal attempt_prompt_text
+                corrective_prompt_applied = bool(diagnosis_validation_details.get("validation_errors"))
+                if corrective_prompt_applied:
+                    feedback = "; ".join(diagnosis_validation_details["validation_errors"][:4])
+                    attempt_prompt_text = (
+                        f"{prompt_text}\n\nDIAGNOSIS VALIDATION FEEDBACK\n{feedback}\n"
+                        "Return a corrected JSON object and use only the allowed action type values."
+                    )
+                recorder.record(
                     "errata_diagnosis_retry",
                     "warning",
                     "errata",
                     "The advisory diagnosis request required a retry.",
-                    details={"attempt": attempt, "error_type": type(exc).__name__, "error": str(exc)},
-                ),
+                    details={
+                        "attempt": attempt,
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                        "corrective_prompt_applied": corrective_prompt_applied,
+                    },
+                )
+
+            parsed = with_retry(
+                run_and_validate,
+                "errata diagnosis",
+                on_retry=on_retry,
             )
             self.performance.record_llm_result(
                 "errata diagnosis",
@@ -377,7 +413,7 @@ class PodcastRagPipeline:
             debug_path = self.write_llm_debug_event(
                 label="errata diagnosis",
                 event="errata_diagnosis_failed",
-                prompt_text=prompt_text,
+                prompt_text=attempt_prompt_text,
                 response_text=short_text(response_text, 1600),
                 error=error_text,
             )
@@ -387,7 +423,12 @@ class PodcastRagPipeline:
                 "warning",
                 "errata",
                 "The advisory LLM diagnosis failed or returned malformed/ungrounded JSON; file outcome is unchanged.",
-                details={"error_type": type(exc).__name__, "error": str(exc), "debug_path": str(debug_path)},
+                details={
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    "debug_path": str(debug_path),
+                    **diagnosis_validation_details,
+                },
                 evidence_paths=[str(debug_path)],
                 excerpts=[short_text(response_text, 800)],
             )
@@ -397,6 +438,7 @@ class PodcastRagPipeline:
                     "error": error_text,
                     "response_excerpt": short_text(response_text, 1600),
                     "debug_path": str(debug_path),
+                    **diagnosis_validation_details,
                 }
             )
 
@@ -418,6 +460,11 @@ class PodcastRagPipeline:
                 }
             )
         return {"nodes": nodes, "node_count": len(docs)}
+
+    def _record_fallback(self) -> None:
+        """Count a fallback both for the run and for the active file."""
+        self.fallback_count += 1
+        self._file_fallback_count = getattr(self, "_file_fallback_count", 0) + 1
 
     def invoke_llm(self, chain, text: str, label: str) -> str:
         if runtime.STOP_REQUESTED:
@@ -451,17 +498,18 @@ class PodcastRagPipeline:
 
         start = time.time()
         token_usage: dict[str, int] = {}
+        attempt_text = text
         try:
             def run_and_validate():
                 nonlocal token_usage
-                raw_candidate = chain.invoke({"text": text})
+                raw_candidate = chain.invoke({"text": attempt_text})
                 token_usage = extract_token_usage(raw_candidate)
                 candidate = extract_llm_text(raw_candidate)
                 if not has_substantive_text(candidate, min_chars=1):
                     debug_path = self.write_llm_debug_event(
                         label=label,
                         event="empty_response",
-                        prompt_text=text,
+                        prompt_text=attempt_text,
                         response_text=candidate,
                         error="Model returned empty assistant message content.",
                         raw_response=raw_candidate,
@@ -481,7 +529,7 @@ class PodcastRagPipeline:
                     debug_path = self.write_llm_debug_event(
                         label=label,
                         event="missing_context_response",
-                        prompt_text=text,
+                        prompt_text=attempt_text,
                         response_text=candidate,
                         error="Response looked like the model was asking for source text that was already provided.",
                         raw_response=raw_candidate,
@@ -499,16 +547,35 @@ class PodcastRagPipeline:
                     raise MissingContextResponse(f"{label} returned a missing-context response instead of a summary.")
                 return candidate
 
-            result = with_retry(
-                run_and_validate,
-                label,
-                on_retry=lambda attempt, exc: self.record_diagnostic(
+            def on_retry(attempt, exc):
+                nonlocal attempt_text
+                corrective_prompt_applied = isinstance(exc, MissingContextResponse)
+                if corrective_prompt_applied:
+                    attempt_text = (
+                        "CORRECTION: The source material is already present below. Episode dates are historical "
+                        "metadata, not deadlines or scheduling signals. Do not request source text or refuse "
+                        "because the date appears earlier or later than today's date. Return the requested "
+                        "output now.\n\n"
+                        f"{text}"
+                    )
+                self.record_diagnostic(
                     "llm_retry",
                     "warning",
                     diagnostic_stage,
                     f"{label} required a retry before succeeding or falling back.",
-                    details={"attempt": attempt, "error_type": type(exc).__name__, "error": str(exc)},
-                ),
+                    details={
+                        "attempt": attempt,
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                        "corrective_prompt_applied": corrective_prompt_applied,
+                    },
+                )
+
+            result = with_retry(
+                run_and_validate,
+                label,
+                retries=2,
+                on_retry=on_retry,
             )
         except EmptyLLMResponse:
             self.performance.record_failure()
@@ -516,7 +583,7 @@ class PodcastRagPipeline:
                 print(f"  {label} returned empty responses; using empty position list.")
                 return '{"positions": []}'
             print(f"  {label} returned empty responses; using fallback extractive summary.")
-            self.fallback_count += 1
+            self._record_fallback()
             result = fallback_summary_from_text(text, label)
             debug_path = self.write_llm_debug_event(
                 label=label,
@@ -541,7 +608,7 @@ class PodcastRagPipeline:
                 print(f"  {label} returned missing-context responses; using empty position list.")
                 return '{"positions": []}'
             print(f"  {label} returned missing-context responses; using fallback extractive summary.")
-            self.fallback_count += 1
+            self._record_fallback()
             result = fallback_summary_from_text(text, label)
             debug_path = self.write_llm_debug_event(
                 label=label,
@@ -588,7 +655,7 @@ class PodcastRagPipeline:
                 print(f"  {label} failed after retries; using empty position list. error={error_text}")
                 return '{"positions": []}'
             print(f"  {label} failed after retries; using fallback extractive summary. error={error_text}")
-            self.fallback_count += 1
+            self._record_fallback()
             result = fallback_summary_from_text(text, label)
 
         self.performance.record_llm_result(label, time.time() - start, result, token_usage)
@@ -1568,7 +1635,7 @@ class PodcastRagPipeline:
             "representations": representation_manifest,
             "prompt_manifest": self.prompt_manifest,
             "token_maxima": self.performance.snapshot(),
-            "fallback_count": self.fallback_count,
+            "fallback_count": getattr(self, "_file_fallback_count", 0),
             "cluster_telemetry": self.cluster_telemetry,
             "validation": {
                 "counts": validation.counts,
@@ -1853,6 +1920,7 @@ class PodcastRagPipeline:
         active_context = getattr(self, "active_context", None) or {}
         fingerprint = str(active_context.get("processing_key") or file_fingerprint(path))
         print(f"\nProcessing: {source}")
+        self._file_fallback_count = 0
         self.performance.start_file(source)
         docs = load_transcript_json(path)
         if active_context:
@@ -1975,6 +2043,6 @@ class PodcastRagPipeline:
             "nodes": len(all_nodes),
             "position_cards": len(position_docs),
             "elapsed_seconds": int(time.time() - start),
-            "fallbacks": self.fallback_count,
+            "fallbacks": getattr(self, "_file_fallback_count", 0),
             "documents": all_nodes,
         }

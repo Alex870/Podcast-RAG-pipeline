@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 import signal
+import shutil
 import time
 import uuid
 from collections import Counter
@@ -95,6 +96,37 @@ def finalize_file_errata(
     except Exception as exc:
         print(f"  Errata artifact write failed (non-fatal): {type(exc).__name__}: {exc}")
         return None
+
+
+def _errata_artifact_paths(errata_dir: Path, recorder: ErrataRecorder) -> tuple[Path, Path]:
+    safe_stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", recorder.source_path.stem).strip("._") or "transcript"
+    safe_fingerprint = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(recorder.source_fingerprint)).strip("._") or "unknown"
+    base = errata_dir / f"{safe_stem}.{safe_fingerprint}.errata"
+    return base.with_suffix(".errata.json"), base.with_suffix(".errata.md")
+
+
+def _backup_reprocess_artifacts(
+    cache_path: Path,
+    errata_dir: Path,
+    recorder: ErrataRecorder | None,
+    state_path: Path,
+    run_id: str,
+) -> dict[str, str]:
+    """Copy the selected episode's current artifacts before a forced rebuild."""
+    backup_root = state_path.parent / "reprocess_backups" / run_id
+    backup_paths: dict[str, str] = {}
+    candidates: list[tuple[str, Path]] = [("cache", cache_path)]
+    if recorder is not None:
+        json_path, markdown_path = _errata_artifact_paths(errata_dir, recorder)
+        candidates.extend([("errata_json", json_path), ("errata_markdown", markdown_path)])
+    for label, source in candidates:
+        if not source.is_file():
+            continue
+        destination = backup_root / label / source.name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+        backup_paths[label] = str(destination)
+    return backup_paths
 
 
 def inspect_errata(config: PipelineConfig, project_dir: Path, selected: str | None) -> int:
@@ -470,9 +502,16 @@ def managed_process_command(config: PipelineConfig, project_dir: Path, argv: lis
     parser.add_argument("--partition")
     parser.add_argument("--episode")
     parser.add_argument("--one-file", action="store_true")
+    parser.add_argument(
+        "--force-reprocess",
+        action="store_true",
+        help="Rebuild exactly one selected episode while preserving its current cache and errata pair as rollback artifacts.",
+    )
     args = parser.parse_args(argv)
     if args.manifest and args.partition:
         raise SystemExit("--manifest and --partition are mutually exclusive")
+    if args.force_reprocess and not args.episode:
+        raise SystemExit("--force-reprocess requires --episode so the rebuild remains scoped to one episode")
     registry = _registry(config, project_dir)
     if args.manifest:
         selected = _registered_handoff(config, project_dir, Path(args.manifest))
@@ -571,6 +610,8 @@ def managed_process_command(config: PipelineConfig, project_dir: Path, argv: lis
     if not input_files:
         print("No declared episodes matched the requested filter.")
         return 1
+    if args.force_reprocess and len(input_files) != 1:
+        raise SystemExit("--force-reprocess requires exactly one matching episode")
     print(f"Processing {len(input_files)} declared episode(s) in partition {spec.partition_id}.")
     lock_path = paths["state"] / "active_run.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -578,7 +619,13 @@ def managed_process_command(config: PipelineConfig, project_dir: Path, argv: lis
         with lock_path.open("x", encoding="utf-8") as handle:
             handle.write(json.dumps({"partition_id": spec.partition_id, "started_at": dt.datetime.now(dt.timezone.utc).isoformat()}))
         try:
-            return run_batch(effective_config, project_dir, args.one_file, input_files=input_files)
+            return run_batch(
+                effective_config,
+                project_dir,
+                args.one_file,
+                input_files=input_files,
+                force_reprocess=args.force_reprocess,
+            )
         finally:
             lock_path.unlink(missing_ok=True)
     except FileExistsError as exc:
@@ -670,9 +717,13 @@ def run_batch(
     *,
     allow_mixed_partitions: bool = False,
     input_files: list[tuple[Path, dict[str, Any] | None]] | None = None,
+    force_reprocess: bool = False,
 ) -> int:
     """Process every pending transcript, reusing caches and checkpoints when possible."""
     runtime.load_runtime_deps()
+
+    if force_reprocess and (not input_files or len(input_files) != 1):
+        raise ValueError("force_reprocess requires exactly one explicitly selected input file")
 
     input_dir = resolve_path(project_dir, config.input_dir)
     processed_dir = resolve_path(project_dir, config.processed_dir)
@@ -718,7 +769,7 @@ def run_batch(
     for path, context in file_entries:
         fingerprint = str((context or {}).get("processing_key") or file_fingerprint(path))
         cache_path = processed_data_cache_path(processed_data_dir, fingerprint, path)
-        if cache_path.exists() or not should_skip_file(state, fingerprint):
+        if force_reprocess or cache_path.exists() or not should_skip_file(state, fingerprint):
             pending.append((path, fingerprint, context))
 
     print(f"Found {len(files)} matching files; {len(pending)} pending.")
@@ -728,7 +779,7 @@ def run_batch(
         return 0
 
     cached_pending = [processed_data_cache_path(processed_data_dir, fingerprint, path).exists() for path, fingerprint, _context in pending]
-    needs_llm_processing = not all(cached_pending)
+    needs_llm_processing = force_reprocess or not all(cached_pending)
     if needs_llm_processing:
         if config.fake_llm:
             print("Fake LLM mode enabled; skipping LM Studio model verification.")
@@ -784,6 +835,7 @@ def run_batch(
         request_start = pipeline.performance.requests
         failure_start = pipeline.performance.failures
         fallback_start = pipeline.fallback_count
+        reprocess_backup_paths: dict[str, str] = {}
 
         def finalize_result(result: dict[str, Any], outcome: str | None = None) -> dict[str, Any]:
             if context:
@@ -824,7 +876,17 @@ def run_batch(
             return result
 
         try:
-            if cache_path.exists():
+            if force_reprocess:
+                reprocess_backup_paths = _backup_reprocess_artifacts(
+                    cache_path,
+                    errata_dir,
+                    recorder,
+                    state_path,
+                    run_id,
+                )
+                pipeline.clear_file_checkpoints(path, fingerprint)
+
+            if cache_path.exists() and not force_reprocess:
                 try:
                     previous_active_errata = pipeline.active_errata
                     pipeline.active_errata = recorder
@@ -901,6 +963,8 @@ def run_batch(
                     )
                     stats.llm_files += 1
                     if result["status"] != "completed":
+                        if reprocess_backup_paths:
+                            result["reprocess_backup_paths"] = reprocess_backup_paths
                         result = finalize_result(result, "skipped")
                         mark_state(state, fingerprint, path, result["status"], result)
                         save_state(state_path, state)
@@ -913,6 +977,8 @@ def run_batch(
                         pipeline.save_cached_documents(cache_path, path, fingerprint, docs, context)
                     else:
                         pipeline.save_cached_documents(cache_path, path, fingerprint, docs)
+                    if reprocess_backup_paths:
+                        result["reprocess_backup_paths"] = reprocess_backup_paths
                     result["cache_path"] = str(cache_path)
                     result["output_cache_path"] = str(cache_path)
                     result["output_cache_sha256"] = hashlib.sha256(cache_path.read_bytes()).hexdigest()
@@ -934,6 +1000,8 @@ def run_batch(
                 )
                 stats.llm_files += 1
                 if result["status"] != "completed":
+                    if reprocess_backup_paths:
+                        result["reprocess_backup_paths"] = reprocess_backup_paths
                     result = finalize_result(result, "skipped")
                     mark_state(state, fingerprint, path, result["status"], result)
                     save_state(state_path, state)
@@ -946,6 +1014,8 @@ def run_batch(
                     pipeline.save_cached_documents(cache_path, path, fingerprint, docs, context)
                 else:
                     pipeline.save_cached_documents(cache_path, path, fingerprint, docs)
+                if reprocess_backup_paths:
+                    result["reprocess_backup_paths"] = reprocess_backup_paths
                 result["cache_path"] = str(cache_path)
                 result["output_cache_path"] = str(cache_path)
                 result["output_cache_sha256"] = hashlib.sha256(cache_path.read_bytes()).hexdigest()
@@ -978,6 +1048,8 @@ def run_batch(
             if recorder is not None:
                 recorder.set_outcome("interrupted", failed_stage="file", exception=exc)
             errata_result = finalize_result({}, "interrupted")
+            if reprocess_backup_paths:
+                errata_result["reprocess_backup_paths"] = reprocess_backup_paths
             mark_state(state, fingerprint, path, "interrupted", {"error": str(exc), **errata_result})
             save_state(state_path, state)
             stats.files_failed += 1
@@ -989,6 +1061,8 @@ def run_batch(
             if recorder is not None:
                 recorder.set_outcome("failed", failed_stage="file", exception=exc)
             errata_result = finalize_result({}, "failed")
+            if reprocess_backup_paths:
+                errata_result["reprocess_backup_paths"] = reprocess_backup_paths
             mark_state(state, fingerprint, path, "failed", {"error": f"{type(exc).__name__}: {exc}", **errata_result})
             save_state(state_path, state)
             stats.files_failed += 1
