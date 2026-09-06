@@ -153,7 +153,7 @@ class PodcastRagPipeline:
             "<<<SOURCE_MATERIAL>>>\n{text}\n<<<END_SOURCE_MATERIAL>>>\n\n"
             f"Summarize only the provided source material for retrieval. Preserve who said what when speaker labels are present. "
             f"Include the episode date when available. Return 5-10 dense bullets, no preamble, no repeated headings, "
-            f"and stay under {self.config.summary_target_chars} characters. Return the final summary now.{self.thinking_control_suffix()}"
+            f"and stay under {self.config.summary_target_chars} characters. Return the final summary now."
         )
         thesis_system = (
             "You are distilling an episode-level worldview summary. Extract the central theses, recurring positions, "
@@ -165,7 +165,7 @@ class PodcastRagPipeline:
             "<<<SOURCE_MATERIAL>>>\n{text}\n<<<END_SOURCE_MATERIAL>>>\n\n"
             f"Create an episode thesis summary using only the provided source material. Preserve which speaker held each position "
             f"when the evidence supports attribution, and include the episode date when available. Return dense bullets, no preamble, "
-            f"no repeated headings, and stay under {self.config.summary_target_chars * 2} characters. Return the final summary now.{self.thinking_control_suffix()}"
+            f"no repeated headings, and stay under {self.config.summary_target_chars * 2} characters. Return the final summary now."
         )
         position_system = (
             "You extract durable positions from long-form podcasts. Return strict JSON only. "
@@ -181,7 +181,7 @@ class PodcastRagPipeline:
             '"evidence_node_ids", "evidence_timestamps", and "keywords".\n\n'
             "Use only evidence from the passages below. Prefer speaker-specific position cards over generic episode-level claims. "
             "If attribution is ambiguous, skip the claim instead of guessing. Return at most 5 positions. Keep each field concise. "
-            f"Return JSON only, with no markdown, no commentary, and no bullet list outside the JSON object.\n\n{{text}}{self.thinking_control_suffix()}"
+            f"Return JSON only, with no markdown, no commentary, and no bullet list outside the JSON object.\n\n{{text}}"
         )
         diagnosis_system = (
             "You diagnose one podcast RAG file from a bounded deterministic review packet. "
@@ -199,6 +199,12 @@ class PodcastRagPipeline:
         )
         self.prompt_manifest = {
             "prompt_version": PROMPT_VERSION,
+            "request_controls": {
+                "summary": {"chat_template_kwargs": {"enable_thinking": False}},
+                "thesis": {"chat_template_kwargs": {"enable_thinking": False}},
+                "position": {"chat_template_kwargs": {"enable_thinking": False}},
+                "diagnosis": {"chat_template_kwargs": {"enable_thinking": False}},
+            },
             "summary_system": summary_system,
             "summary_user": summary_user,
             "thesis_system": thesis_system,
@@ -208,21 +214,41 @@ class PodcastRagPipeline:
             "diagnosis_system": diagnosis_system,
             "diagnosis_user": diagnosis_user,
         }
-        self.summary_chain = self.make_chain(ChatPromptTemplate.from_messages([("system", summary_system), ("user", summary_user)]))
-        self.thesis_chain = self.make_chain(ChatPromptTemplate.from_messages([("system", thesis_system), ("user", thesis_user)]))
-        self.position_chain = self.make_chain(ChatPromptTemplate.from_messages([("system", position_system), ("user", position_user)]))
-        self.diagnosis_chain = self.make_chain(ChatPromptTemplate.from_messages([("system", diagnosis_system), ("user", diagnosis_user)]))
+        self.summary_chain = self.make_chain(
+            ChatPromptTemplate.from_messages([("system", summary_system), ("user", summary_user)]),
+            enable_thinking=False,
+        )
+        self.thesis_chain = self.make_chain(
+            ChatPromptTemplate.from_messages([("system", thesis_system), ("user", thesis_user)]),
+            enable_thinking=False,
+        )
+        self.position_chain = self.make_chain(
+            ChatPromptTemplate.from_messages([("system", position_system), ("user", position_user)]),
+            enable_thinking=False,
+        )
+        self.diagnosis_chain = self.make_chain(
+            ChatPromptTemplate.from_messages([("system", diagnosis_system), ("user", diagnosis_user)]),
+            enable_thinking=False,
+        )
 
-    def make_chain(self, prompt):
+    def make_chain(self, prompt, *, enable_thinking: bool | None = False):
         if self.config.fake_llm:
             return FakeChain()
-        return prompt | self.llm
+        return prompt | self._llm_for_call(enable_thinking)
 
-    def thinking_control_suffix(self) -> str:
-        model_name = (self.config.lm_studio_model or "").lower()
-        if "qwen" in model_name:
-            return "\n/no_think"
-        return ""
+    def _llm_for_call(self, enable_thinking: bool | None):
+        """Return the shared model with an optional request-scoped thinking control.
+
+        The base ``self.llm`` remains unmodified so callers that need reasoning can
+        continue to use the model normally. ``ChatOpenAI`` forwards ``extra_body``
+        to the OpenAI-compatible server, where Qwen's chat template consumes the
+        ``enable_thinking`` request parameter.
+        """
+        if enable_thinking is None:
+            return self.llm
+        return self.llm.bind(
+            extra_body={"chat_template_kwargs": {"enable_thinking": bool(enable_thinking)}}
+        )
 
     def record_diagnostic(
         self,
