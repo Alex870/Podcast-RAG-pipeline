@@ -125,6 +125,43 @@ Stable IDs should derive from source identity and normalized semantic role, not 
 
 All LLM operations must use discovered context limits, explicit prompt budgets, reserved completion capacity, bounded retries, and durable checkpoints. Frontier features must degrade cleanly to the existing baseline.
 
+### 4.7 Adaptive Hierarchy and Safe Reprocessing
+
+Hierarchy construction uses the versioned `adaptive-v2` policy. Zero or one
+current node stops; two through eleven nodes receive one forced parent; twelve
+or more nodes use semantic clustering only when the result has at least two
+groups, no dominant group above `0.60`, noise at or below `0.25`, and no more
+than `max_clusters`. Failed quality gates use deterministic chronological
+groups of `group_fallback_size`. The policy continues through `max_levels` and
+does not stop merely because a level is smaller than the semantic-clustering
+threshold. Summary levels use a less conservative HDBSCAN profile with an
+adaptive cluster-size range of `3` through `6` based on the summary count and
+an explicit `min_samples` of `2`; these values are configurable through the
+`hierarchy_summary_*` settings. Each cache records a file-local
+`hierarchy_manifest` with level counts, strategy, clustering parameters,
+quality metrics, fallback reasons, forced-rollup levels, and the stop reason.
+
+Structural provenance is separate from generation provenance. Hierarchy
+`child_ids` and `parent_id` describe the evidence graph, while an episode
+thesis may record `generation_source_node_ids` for the deepest meaningful
+multi-summary level used to write its text. These optional references are
+validated as references, not treated as structural edges.
+
+The managed `--force-reprocess --episode` path uses a run-specific checkpoint
+namespace and never deletes normal checkpoints or versioned caches. Before
+processing it writes a rollback bundle under
+`state/reprocess_backups/<run-id>/` containing artifact presence, original
+paths, SHA-256 checksums, prior state metadata, and promotion status. Cache and
+errata publication use same-directory atomic replacement; a promotion failure
+restores the prior canonical artifact set.
+
+Errata diagnosis remains advisory. Its action vocabulary is limited to
+`code`, `config`, `data`, `rerun`, and `human_review`; malformed output cannot
+change file outcome, cache state, state records, or remediation behavior.
+Failure details retain only bounded validation errors, indexed invalid action
+types, digests, and a bounded response excerpt—never `raw_response` or an
+unbounded model response.
+
 ## 5. Target Data Contract
 
 ## 5.1 Cache Envelope
@@ -736,6 +773,10 @@ Promotion reports should compare a candidate against a named baseline and includ
 - Lexical normalization.
 - Stable ID behavior.
 - Schema validation.
+- Adaptive hierarchy quality gates, chronological fallback, forced 2–11-node parents, singleton stopping, and the known `[208, 15, 1, 1, 1]` regression.
+- Structural versus thesis-generation provenance and file-local hierarchy telemetry.
+- Historical-date prompts, corrective retry placement, cache fingerprint invalidation, and bounded advisory diagnosis records.
+- Force-reprocess checkpoint isolation, rollback checksums, artifact presence metadata, and failed-promotion restoration.
 - Claim relationship validation.
 - Metric calculations with known rankings.
 - Reciprocal rank fusion with deterministic fixtures.

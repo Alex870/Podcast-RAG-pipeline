@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import signal
+import sys
 import time
 from collections import deque
 from pathlib import Path
@@ -11,9 +12,10 @@ from typing import Any
 from podcast_rag.config import PipelineConfig, resolve_path
 
 STOP_REQUESTED = False
+STOP_SIGNAL = None
 RUNTIME_DEPS_LOADED = False
-PIPELINE_VERSION = "0.3.0"
-PROMPT_VERSION = "2026-05-12"
+PIPELINE_VERSION = "0.4.0"
+PROMPT_VERSION = "2026-09-06"
 
 def load_runtime_deps() -> None:
     """Import heavyweight ML/runtime dependencies on demand for faster startup."""
@@ -365,5 +367,20 @@ class FakeChain:
 
 def request_stop(signum, frame):
     global STOP_REQUESTED
+    global STOP_SIGNAL
+    if STOP_REQUESTED:
+        print(
+            "\nStop already requested; finishing the current safe boundary and exiting without confirmation.",
+            file=sys.stderr,
+            flush=True,
+        )
+        return
     STOP_REQUESTED = True
-    print("\nStop requested. No new model requests will be started; waiting for in-flight request(s) to finish.")
+    STOP_SIGNAL = signum
+    signal_name = "Ctrl+C" if signum == signal.SIGINT else "Termination signal"
+    print(
+        f"\n{signal_name} received. No new model requests will be started; "
+        "waiting for in-flight request(s) to finish before exiting.",
+        file=sys.stderr,
+        flush=True,
+    )

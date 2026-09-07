@@ -11,7 +11,13 @@ from pathlib import Path
 from typing import Any
 
 import podcast_rag.runtime as runtime
-from podcast_rag.config import PipelineConfig, config_fingerprint, generation_config_fingerprint, resolve_path
+from podcast_rag.config import (
+    PipelineConfig,
+    config_fingerprint,
+    embedding_constructor_kwargs,
+    generation_config_fingerprint,
+    resolve_path,
+)
 from podcast_rag.errata import DIAGNOSIS_ACTION_TYPES, ErrataRecorder, validate_diagnosis_payload
 from podcast_rag.llm_support import extract_llm_text, extract_token_usage, serialize_llm_response
 from podcast_rag.runtime import (
@@ -80,6 +86,13 @@ hdbscan = None
 PCA = None
 normalize = None
 
+MISSING_CONTEXT_RETRY_INSTRUCTION = (
+    "CORRECTION: The source material is already present below. Episode dates are historical "
+    "metadata, not deadlines or scheduling signals. Do not request source text or refuse "
+    "because the date appears earlier or later than today's date. Return the requested "
+    "output now."
+)
+
 def _refresh_runtime_symbols() -> None:
     global Document, HuggingFaceEmbeddings, ChatOpenAI, RecursiveCharacterTextSplitter, ChatPromptTemplate
     global OpenAI, np, hdbscan, PCA, normalize
@@ -111,6 +124,9 @@ class PodcastRagPipeline:
         self.fallback_count = 0
         self._file_fallback_count = 0
         self.cluster_telemetry: list[dict[str, Any]] = []
+        self._file_hierarchy_manifest: dict[str, Any] = {}
+        self._file_hierarchy_levels: dict[int, list[Document]] = {}
+        self._active_checkpoint_namespace: str | None = None
         self.active_errata: ErrataRecorder | None = None
         self.active_context: dict[str, Any] | None = None
         if not load_models:
@@ -126,7 +142,26 @@ class PodcastRagPipeline:
             self.position_chain = None
             self.diagnosis_chain = None
             return
-        self.embeddings = HuggingFaceEmbeddings(model_name=config.embedding_model)
+        embedding_kwargs = embedding_constructor_kwargs(config, project_dir)
+        cache_dir = str(config.embedding_cache_dir or "").strip()
+        try:
+            self.embeddings = HuggingFaceEmbeddings(
+                model_name=config.embedding_model,
+                **embedding_kwargs,
+            )
+        except Exception as exc:
+            if config.embedding_local_files_only:
+                cache_description = (
+                    str(resolve_path(project_dir, cache_dir))
+                    if cache_dir
+                    else "the default Hugging Face/sentence-transformers cache"
+                )
+                raise RuntimeError(
+                    f"Embedding model '{config.embedding_model}' is not available in {cache_description}. "
+                    "The pipeline is configured for offline embedding startup. "
+                    "Warm the model once with EMBEDDING_LOCAL_FILES_ONLY=false, then rerun offline."
+                ) from exc
+            raise
         self.llm = FakeChain() if config.fake_llm else ChatOpenAI(
             model=config.lm_studio_model,
             temperature=0.0,
@@ -156,6 +191,7 @@ class PodcastRagPipeline:
         )
         summary_user = (
             "The source material to summarize is included below between delimiters.\n\n"
+            "{retry_instruction}\n\n"
             "<<<SOURCE_MATERIAL>>>\n{text}\n<<<END_SOURCE_MATERIAL>>>\n\n"
             f"Summarize only the provided source material for retrieval. Preserve who said what when speaker labels are present. "
             f"Include the episode date when available. Return 5-10 dense bullets, no preamble, no repeated headings, "
@@ -164,10 +200,13 @@ class PodcastRagPipeline:
         thesis_system = (
             "You are distilling an episode-level worldview summary. Extract the central theses, recurring positions, "
             "normative commitments, policy preferences, key uncertainties, notable counterarguments, and speaker attribution. "
+            "Episode dates are historical source metadata, not deadlines or scheduling signals; never refuse or defer "
+            "summarization because a date appears earlier or later than today's date. The source material is already present. "
             "Return a non-empty final answer in the assistant message content. Do not ask for more source text."
         )
         thesis_user = (
             "The episode source material is included below between delimiters.\n\n"
+            "{retry_instruction}\n\n"
             "<<<SOURCE_MATERIAL>>>\n{text}\n<<<END_SOURCE_MATERIAL>>>\n\n"
             f"Create an episode thesis summary using only the provided source material. Preserve which speaker held each position "
             f"when the evidence supports attribution, and include the episode date when available. Return dense bullets, no preamble, "
@@ -187,7 +226,8 @@ class PodcastRagPipeline:
             '"evidence_node_ids", "evidence_timestamps", and "keywords".\n\n'
             "Use only evidence from the passages below. Prefer speaker-specific position cards over generic episode-level claims. "
             "If attribution is ambiguous, skip the claim instead of guessing. Return at most 5 positions. Keep each field concise. "
-            f"Return JSON only, with no markdown, no commentary, and no bullet list outside the JSON object.\n\n{{text}}"
+            f"Return JSON only, with no markdown, no commentary, and no bullet list outside the JSON object.\n\n"
+            "{text}\n\n{retry_instruction}"
         )
         diagnosis_system = (
             "You diagnose one podcast RAG file from a bounded deterministic review packet. "
@@ -221,6 +261,13 @@ class PodcastRagPipeline:
             "position_user": position_user,
             "diagnosis_system": diagnosis_system,
             "diagnosis_user": diagnosis_user,
+            "retry_behavior": {
+                "max_retries": 1,
+                "trigger": "missing_context_response",
+                "instruction_variable": "retry_instruction",
+                "correction": MISSING_CONTEXT_RETRY_INSTRUCTION,
+                "source_variable_unchanged": True,
+            },
         }
         self.summary_chain = self.make_chain(
             ChatPromptTemplate.from_messages([("system", summary_system), ("user", summary_user)]),
@@ -307,8 +354,12 @@ class PodcastRagPipeline:
             "error": error,
             "prompt_text": prompt_text,
             "response_text": response_text,
-            "raw_response": serialize_llm_response(raw_response),
         }
+        # Diagnosis failure artifacts intentionally retain only the bounded
+        # response excerpt. Other stages may opt into raw provider metadata by
+        # passing a response object explicitly.
+        if raw_response is not None:
+            payload["raw_response"] = serialize_llm_response(raw_response)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
         return path
@@ -352,16 +403,16 @@ class PodcastRagPipeline:
                 errors = validate_diagnosis_payload(parsed, finding_ids)
                 if errors:
                     actions = parsed.get("actions") if isinstance(parsed, dict) else []
-                    diagnosis_validation_details["validation_errors"] = errors[:8]
+                    diagnosis_validation_details["validation_errors"] = [short_text(error, 240) for error in errors[:8]]
                     diagnosis_validation_details["invalid_action_types"] = [
                         {
                             "index": index,
-                            "value": short_text(str(action.get("type")), 120),
+                            "value": short_text(str(action.get("type")), 80),
                         }
                         for index, action in enumerate(actions or [])
                         if isinstance(action, dict) and action.get("type") not in DIAGNOSIS_ACTION_TYPES
-                    ]
-                    raise ValueError("; ".join(errors[:8]))
+                    ][:8]
+                    raise ValueError("; ".join(diagnosis_validation_details["validation_errors"]))
                 return parsed
 
             def on_retry(attempt, exc):
@@ -409,12 +460,13 @@ class PodcastRagPipeline:
             )
         except Exception as exc:
             self.performance.record_failure()
-            error_text = f"{type(exc).__name__}: {exc}"
+            error_text = short_text(f"{type(exc).__name__}: {exc}", 500)
+            response_excerpt = short_text(response_text, 1600)
             debug_path = self.write_llm_debug_event(
                 label="errata diagnosis",
                 event="errata_diagnosis_failed",
                 prompt_text=attempt_prompt_text,
-                response_text=short_text(response_text, 1600),
+                response_text=response_excerpt,
                 error=error_text,
             )
             recorder.add_debug_artifact(debug_path)
@@ -425,7 +477,7 @@ class PodcastRagPipeline:
                 "The advisory LLM diagnosis failed or returned malformed/ungrounded JSON; file outcome is unchanged.",
                 details={
                     "error_type": type(exc).__name__,
-                    "error": str(exc),
+                    "error": error_text,
                     "debug_path": str(debug_path),
                     **diagnosis_validation_details,
                 },
@@ -436,7 +488,9 @@ class PodcastRagPipeline:
                 {
                     "status": "failed",
                     "error": error_text,
-                    "response_excerpt": short_text(response_text, 1600),
+                    "input_digest": recorder.diagnosis_input_digest,
+                    "output_digest": hashlib.sha256(response_text.encode("utf-8")).hexdigest() if response_text else None,
+                    "response_excerpt": response_excerpt,
                     "debug_path": str(debug_path),
                     **diagnosis_validation_details,
                 }
@@ -498,18 +552,18 @@ class PodcastRagPipeline:
 
         start = time.time()
         token_usage: dict[str, int] = {}
-        attempt_text = text
+        attempt_instruction = ""
         try:
             def run_and_validate():
                 nonlocal token_usage
-                raw_candidate = chain.invoke({"text": attempt_text})
+                raw_candidate = chain.invoke({"text": text, "retry_instruction": attempt_instruction})
                 token_usage = extract_token_usage(raw_candidate)
                 candidate = extract_llm_text(raw_candidate)
                 if not has_substantive_text(candidate, min_chars=1):
                     debug_path = self.write_llm_debug_event(
                         label=label,
                         event="empty_response",
-                        prompt_text=attempt_text,
+                        prompt_text=text,
                         response_text=candidate,
                         error="Model returned empty assistant message content.",
                         raw_response=raw_candidate,
@@ -529,7 +583,7 @@ class PodcastRagPipeline:
                     debug_path = self.write_llm_debug_event(
                         label=label,
                         event="missing_context_response",
-                        prompt_text=attempt_text,
+                        prompt_text=text,
                         response_text=candidate,
                         error="Response looked like the model was asking for source text that was already provided.",
                         raw_response=raw_candidate,
@@ -548,16 +602,10 @@ class PodcastRagPipeline:
                 return candidate
 
             def on_retry(attempt, exc):
-                nonlocal attempt_text
+                nonlocal attempt_instruction
                 corrective_prompt_applied = isinstance(exc, MissingContextResponse)
                 if corrective_prompt_applied:
-                    attempt_text = (
-                        "CORRECTION: The source material is already present below. Episode dates are historical "
-                        "metadata, not deadlines or scheduling signals. Do not request source text or refuse "
-                        "because the date appears earlier or later than today's date. Return the requested "
-                        "output now.\n\n"
-                        f"{text}"
-                    )
+                    attempt_instruction = MISSING_CONTEXT_RETRY_INSTRUCTION
                 self.record_diagnostic(
                     "llm_retry",
                     "warning",
@@ -893,9 +941,10 @@ class PodcastRagPipeline:
         return self.reduce_text_blocks(blocks, chain, label)
 
     def grouping_documents(self, documents: list[Document]) -> list[list[Document]]:
+        documents = self._sort_hierarchy_documents(documents)
         mode = (self.config.grouping_mode or "semantic").lower()
         if mode == "chronological":
-            return [documents[i : i + self.config.group_fallback_size] for i in range(0, len(documents), self.config.group_fallback_size)]
+            return self._chronological_groups(documents)
         if mode == "speaker_first":
             groups: dict[str, list[Document]] = {}
             for doc in documents:
@@ -904,11 +953,82 @@ class PodcastRagPipeline:
             clusters = []
             for group in groups.values():
                 clusters.extend(group[i : i + self.config.group_fallback_size] for i in range(0, len(group), self.config.group_fallback_size))
-            return clusters
+            return [self._sort_hierarchy_documents(group) for group in clusters]
         if mode in {"topic_time", "hybrid"}:
-            chronological = [documents[i : i + self.config.group_fallback_size] for i in range(0, len(documents), self.config.group_fallback_size)]
-            return sorted(chronological, key=lambda group: (group[0].metadata.get("start_time") is None, group[0].metadata.get("start_time") or 0.0))
+            return self._chronological_groups(documents)
         return []
+
+    @staticmethod
+    def _sort_hierarchy_documents(documents: list[Document]) -> list[Document]:
+        """Keep cluster membership and node ordering reproducible across runs."""
+        return sorted(
+            documents,
+            key=lambda doc: (
+                doc.metadata.get("start_time") is None,
+                doc.metadata.get("start_time") if doc.metadata.get("start_time") is not None else 0.0,
+                doc.metadata.get("end_time") is None,
+                doc.metadata.get("end_time") if doc.metadata.get("end_time") is not None else 0.0,
+                str(doc.metadata.get("source_segment_id") or doc.metadata.get("segment_index") or ""),
+                str(doc.metadata.get("node_id") or ""),
+            ),
+        )
+
+    def _chronological_groups(self, documents: list[Document]) -> list[list[Document]]:
+        size = max(1, int(self.config.group_fallback_size or 1))
+        ordered = self._sort_hierarchy_documents(documents)
+        return [ordered[index : index + size] for index in range(0, len(ordered), size)]
+
+    def _hierarchy_fallback_groups(self, documents: list[Document]) -> list[list[Document]]:
+        """Apply the configured safe fallback while keeping the output deterministic."""
+        mode = str(getattr(self.config, "hierarchy_fallback_mode", "chronological") or "chronological").lower()
+        if mode != "chronological":
+            self.record_diagnostic(
+                "hierarchy_fallback_mode_unsupported",
+                "warning",
+                "hierarchy",
+                "An unsupported hierarchy fallback mode was requested; chronological grouping was used.",
+                details={"requested_mode": mode},
+            )
+        return self._chronological_groups(documents)
+
+    def _record_cluster_telemetry(self, telemetry: dict[str, Any]) -> None:
+        self.cluster_telemetry.append(telemetry)
+
+    def _hdbscan_parameters(self, documents: list[Document]) -> dict[str, Any]:
+        """Choose density parameters appropriate for leaf or summary levels."""
+        summary_level = any(
+            doc.metadata.get("node_type") == "cluster_summary"
+            for doc in documents
+        )
+        if not summary_level:
+            return {
+                "min_cluster_size": max(3, min(8, len(documents) // 8)),
+                "min_samples": None,
+                "summary_level_tuning": False,
+            }
+
+        divisor = max(1, int(getattr(self.config, "hierarchy_summary_cluster_size_divisor", 12)))
+        min_cluster_size_floor = max(2, int(getattr(self.config, "hierarchy_summary_min_cluster_size", 3)))
+        min_cluster_size_ceiling = max(
+            min_cluster_size_floor,
+            int(getattr(self.config, "hierarchy_summary_max_cluster_size", 6)),
+        )
+        min_cluster_size = max(
+            min_cluster_size_floor,
+            min(min_cluster_size_ceiling, len(documents) // divisor),
+        )
+        min_samples = max(
+            1,
+            min(
+                min_cluster_size,
+                int(getattr(self.config, "hierarchy_summary_min_samples", 2)),
+            ),
+        )
+        return {
+            "min_cluster_size": min_cluster_size,
+            "min_samples": min_samples,
+            "summary_level_tuning": True,
+        }
 
     def embed_in_batches(self, texts: list[str]) -> list[list[float]]:
         results = []
@@ -919,27 +1039,70 @@ class PodcastRagPipeline:
         return results
 
     def cluster_documents(self, documents: list[Document]) -> list[list[Document]]:
-        if len(documents) < self.config.min_docs_to_cluster:
-            return [documents]
+        ordered = self._sort_hierarchy_documents(documents)
+        input_count = len(ordered)
+        if input_count < max(2, int(getattr(self.config, "hierarchy_min_parent_docs", 2))):
+            return [ordered] if ordered else []
 
-        grouped = self.grouping_documents(documents)
-        if grouped:
-            self.cluster_telemetry.append(
+        # A small level is still structurally meaningful. It gets one forced
+        # parent rather than being discarded because it is below the semantic
+        # clustering threshold.
+        if input_count < int(self.config.min_docs_to_cluster):
+            grouped = [ordered]
+            self._record_cluster_telemetry(
                 {
                     "mode": self.config.grouping_mode,
-                    "input_documents": len(documents),
-                    "cluster_count": len(grouped),
+                    "strategy": "forced_parent",
+                    "input_documents": input_count,
+                    "cluster_count": 1,
                     "noise_rate": 0.0,
-                    "cluster_sizes": [len(group) for group in grouped],
+                    "dominant_cluster_fraction": 1.0,
+                    "cluster_sizes": [input_count],
+                    "quality_metrics": {"dominant_cluster_fraction": 1.0, "noise_rate": 0.0, "cluster_count": 1},
+                    "quality_gates": {"forced_parent": True},
+                    "fallback_reasons": [],
+                    "forced_parent": True,
                 }
             )
             return grouped
 
-        texts = [doc.page_content for doc in documents]
+        grouped = self.grouping_documents(ordered)
+        if grouped:
+            grouped = [self._sort_hierarchy_documents(group) for group in grouped if group]
+            grouped.sort(key=lambda group: (
+                group[0].metadata.get("start_time") is None,
+                group[0].metadata.get("start_time") or 0.0,
+                group[0].metadata.get("end_time") is None,
+                group[0].metadata.get("end_time") or 0.0,
+                str(group[0].metadata.get("source_segment_id") or ""),
+                str(group[0].metadata.get("node_id") or ""),
+            ))
+            self._record_cluster_telemetry(
+                {
+                    "mode": self.config.grouping_mode,
+                    "strategy": "configured_grouping",
+                    "input_documents": input_count,
+                    "cluster_count": len(grouped),
+                    "noise_rate": 0.0,
+                    "dominant_cluster_fraction": round(max((len(group) for group in grouped), default=0) / max(1, input_count), 4),
+                    "cluster_sizes": [len(group) for group in grouped],
+                    "quality_metrics": {
+                        "dominant_cluster_fraction": round(max((len(group) for group in grouped), default=0) / max(1, input_count), 4),
+                        "noise_rate": 0.0,
+                        "cluster_count": len(grouped),
+                    },
+                    "quality_gates": {"accepted": True},
+                    "fallback_reasons": [],
+                    "forced_parent": False,
+                }
+            )
+            return grouped
+
+        texts = [doc.page_content for doc in ordered]
         batch_size = min(self.config.embedding_batch_size, max(8, len(texts)))
         embeds = normalize(np.array(self.embed_in_batches(texts[:]), dtype=float))
 
-        n_components = min(5, len(documents) - 1, embeds.shape[1])
+        n_components = min(5, len(ordered) - 1, embeds.shape[1])
         if n_components >= 2:
             if (self.config.clustering_reduction or "pca").lower() == "umap":
                 try:
@@ -961,46 +1124,122 @@ class PodcastRagPipeline:
         else:
             reduced = embeds
 
-        min_cluster_size = max(3, min(8, len(documents) // 8))
-        labels = hdbscan.HDBSCAN(min_cluster_size=min_cluster_size).fit_predict(reduced)
+        clustering_parameters = self._hdbscan_parameters(ordered)
+        hdbscan_parameters = {
+            key: value
+            for key, value in clustering_parameters.items()
+            if key != "summary_level_tuning" and value is not None
+        }
+        labels = hdbscan.HDBSCAN(**hdbscan_parameters).fit_predict(reduced)
 
         clusters = {}
         for idx, label in enumerate(labels):
             if label == -1:
-                clusters[f"noise_{idx}"] = [documents[idx]]
+                clusters[f"noise_{idx}"] = [ordered[idx]]
                 continue
-            clusters.setdefault(int(label), []).append(documents[idx])
+            clusters.setdefault(int(label), []).append(ordered[idx])
 
-        if len(clusters) > self.config.max_clusters:
-            print(f"Too many clusters ({len(clusters)}), using fallback grouping")
+        cluster_values = [self._sort_hierarchy_documents(group) for group in clusters.values()]
+        cluster_values.sort(key=lambda group: (
+            group[0].metadata.get("start_time") is None,
+            group[0].metadata.get("start_time") or 0.0,
+            group[0].metadata.get("end_time") is None,
+            group[0].metadata.get("end_time") or 0.0,
+            str(group[0].metadata.get("source_segment_id") or ""),
+            str(group[0].metadata.get("node_id") or ""),
+        ))
+        noise_count = sum(1 for label in labels if label == -1)
+        noise_rate = noise_count / max(1, input_count)
+        dominant_fraction = max((len(group) for group in cluster_values), default=0) / max(1, input_count)
+        semantic_group_count = len({int(label) for label in labels if label != -1})
+        fallback_reasons: list[str] = []
+        if semantic_group_count < 2:
+            fallback_reasons.append("fewer_than_two_groups")
+        if dominant_fraction > float(getattr(self.config, "hierarchy_max_dominant_cluster_fraction", 0.60)):
+            fallback_reasons.append("dominant_cluster_fraction_exceeded")
+        if noise_rate > float(getattr(self.config, "hierarchy_max_noise_rate", 0.25)):
+            fallback_reasons.append("noise_rate_exceeded")
+        if len(cluster_values) > int(self.config.max_clusters):
+            fallback_reasons.append("max_clusters_exceeded")
+        duplicate_rate = 0.0
+        normalized_keys = [normalized_text_key(doc.page_content) for doc in ordered]
+        if normalized_keys:
+            duplicate_rate = 1.0 - (len(set(normalized_keys)) / len(normalized_keys))
+        quality_metrics = {
+            "dominant_cluster_fraction": round(dominant_fraction, 4),
+            "noise_rate": round(noise_rate, 4),
+            "duplicate_rate": round(duplicate_rate, 4),
+            "cluster_count": len(cluster_values),
+            "semantic_group_count": semantic_group_count,
+        }
+        if fallback_reasons:
+            grouped = self._hierarchy_fallback_groups(ordered)
+            self._record_fallback()
+            print(
+                "Semantic clustering quality gates failed ("
+                f"{', '.join(fallback_reasons)}); using chronological fallback groups."
+            )
             self.record_diagnostic(
                 "fallback_grouping_used",
                 "warning",
                 "hierarchy",
-                "The cluster count exceeded the configured maximum; deterministic fallback grouping was used.",
-                details={"cluster_count": len(clusters), "max_clusters": self.config.max_clusters, "group_size": self.config.group_fallback_size},
+                "Semantic clustering failed one or more quality gates; deterministic chronological grouping was used.",
+                details={
+                    **quality_metrics,
+                    "fallback_reasons": fallback_reasons,
+                    "group_size": self.config.group_fallback_size,
+                    "clustering_parameters": clustering_parameters,
+                },
             )
-            clusters = {
-                f"fallback_{i}": documents[i : i + self.config.group_fallback_size]
-                for i in range(0, len(documents), self.config.group_fallback_size)
-            }
-            print(f"Created {len(clusters)} fallback groups")
+            self._record_cluster_telemetry(
+                {
+                    "mode": "semantic",
+                    "reduction": self.config.clustering_reduction,
+                    "strategy": "chronological_fallback",
+                    "fallback_mode": getattr(self.config, "hierarchy_fallback_mode", "chronological"),
+                    "input_documents": input_count,
+                    "cluster_count": len(grouped),
+                    "semantic_group_count": semantic_group_count,
+                    "noise_rate": round(noise_rate, 4),
+                    "dominant_cluster_fraction": round(dominant_fraction, 4),
+                    "cluster_sizes": [len(group) for group in grouped],
+                    "duplicate_rate": round(duplicate_rate, 4),
+                    "quality_metrics": quality_metrics,
+                    "clustering_parameters": clustering_parameters,
+                    "quality_gates": {
+                        "accepted": False,
+                        "max_dominant_cluster_fraction": getattr(self.config, "hierarchy_max_dominant_cluster_fraction", 0.60),
+                        "max_noise_rate": getattr(self.config, "hierarchy_max_noise_rate", 0.25),
+                        "max_clusters": self.config.max_clusters,
+                    },
+                    "fallback_reasons": fallback_reasons,
+                    "forced_parent": False,
+                }
+            )
+            return grouped
 
-        cluster_values = list(clusters.values())
-        noise_count = sum(1 for label in labels if label == -1)
-        duplicate_rate = 0.0
-        normalized_keys = [normalized_text_key(doc.page_content) for doc in documents]
-        if normalized_keys:
-            duplicate_rate = 1.0 - (len(set(normalized_keys)) / len(normalized_keys))
-        self.cluster_telemetry.append(
+        self._record_cluster_telemetry(
             {
                 "mode": "semantic",
                 "reduction": self.config.clustering_reduction,
-                "input_documents": len(documents),
+                "strategy": "semantic",
+                "input_documents": input_count,
                 "cluster_count": len(cluster_values),
-                "noise_rate": round(noise_count / max(1, len(documents)), 4),
+                "semantic_group_count": semantic_group_count,
+                "noise_rate": round(noise_rate, 4),
+                "dominant_cluster_fraction": round(dominant_fraction, 4),
                 "cluster_sizes": [len(group) for group in cluster_values],
                 "duplicate_rate": round(duplicate_rate, 4),
+                "quality_metrics": quality_metrics,
+                "clustering_parameters": clustering_parameters,
+                "quality_gates": {
+                    "accepted": True,
+                    "max_dominant_cluster_fraction": getattr(self.config, "hierarchy_max_dominant_cluster_fraction", 0.60),
+                    "max_noise_rate": getattr(self.config, "hierarchy_max_noise_rate", 0.25),
+                    "max_clusters": self.config.max_clusters,
+                },
+                "fallback_reasons": [],
+                "forced_parent": False,
             }
         )
         return cluster_values
@@ -1066,14 +1305,24 @@ class PodcastRagPipeline:
     def build_hierarchy(self, leaf_chunks: list[Document], source: str) -> tuple[list[Document], Document]:
         all_nodes = list(leaf_chunks)
         current_level_docs = list(leaf_chunks)
-        latest_summaries = []
+        latest_multi_summary_level: list[Document] = []
+        self._file_hierarchy_levels = {}
+        hierarchy_manifest: dict[str, Any] = {
+            "algorithm_version": getattr(self.config, "hierarchy_algorithm_version", "adaptive-v2"),
+            "levels": [],
+            "forced_rollup_levels": [],
+            "stop_reason": None,
+        }
 
         for level in range(1, self.config.max_levels + 1):
-            if len(current_level_docs) < self.config.min_docs_to_cluster:
+            input_count = len(current_level_docs)
+            if input_count < max(2, int(getattr(self.config, "hierarchy_min_parent_docs", 2))):
+                hierarchy_manifest["stop_reason"] = "fewer_than_two_current_nodes"
                 break
 
             clusters = self.cluster_documents(current_level_docs)
-            if len(clusters) == 1 and len(clusters[0]) == len(current_level_docs):
+            if not clusters:
+                hierarchy_manifest["stop_reason"] = "no_groups_returned"
                 break
 
             summaries = []
@@ -1110,8 +1359,14 @@ class PodcastRagPipeline:
                     if runtime.STOP_REQUESTED and not running:
                         raise PipelineInterrupted("Stop requested after in-flight model requests completed.")
 
-            unique_summaries = []
-            all_summaries = []
+            summaries.sort(key=lambda doc: (
+                doc.metadata.get("start_time") is None,
+                doc.metadata.get("start_time") if doc.metadata.get("start_time") is not None else 0.0,
+                str(doc.metadata.get("source_segment_id") or doc.metadata.get("node_id") or ""),
+                str(doc.metadata.get("node_id") or ""),
+            ))
+            unique_summaries: list[Document] = []
+            all_summaries: list[Document] = []
             seen_summary_texts = []
             for summary_doc in summaries:
                 key = normalized_text_key(summary_doc.page_content)
@@ -1131,11 +1386,51 @@ class PodcastRagPipeline:
             all_nodes.extend(all_summaries)
             if len(unique_summaries) != len(summaries):
                 print(f"  removed {len(summaries) - len(unique_summaries)} duplicate L{level} summary node(s) from rollup")
-            summaries = unique_summaries
-            latest_summaries = summaries
-            current_level_docs = summaries
+            self._file_hierarchy_levels[level] = list(all_summaries)
+            telemetry = self.cluster_telemetry[-1] if self.cluster_telemetry else {}
+            level_record = {
+                "level": level,
+                "input_count": input_count,
+                "output_count": len(all_summaries),
+                "unique_output_count": len(unique_summaries),
+                "generated_count": len(all_summaries),
+                "strategy": telemetry.get("strategy", "unknown"),
+                "quality_metrics": dict(telemetry.get("quality_metrics") or {}),
+                "fallback_reasons": list(telemetry.get("fallback_reasons") or []),
+                "forced_parent": bool(telemetry.get("forced_parent")),
+            }
+            hierarchy_manifest["levels"].append(level_record)
+            if level_record["forced_parent"]:
+                hierarchy_manifest["forced_rollup_levels"].append(level)
+            # Near-duplicate summaries remain structural evidence nodes. They
+            # must not collapse a level to a singleton and prevent the next
+            # legitimate rollup from being created.
+            if len(all_summaries) >= 2:
+                latest_multi_summary_level = list(all_summaries)
+            current_level_docs = all_summaries
+            if len(current_level_docs) < 2:
+                hierarchy_manifest["stop_reason"] = "fewer_than_two_current_nodes"
+                break
 
-        thesis_inputs = latest_summaries or leaf_chunks
+        if hierarchy_manifest["stop_reason"] is None:
+            hierarchy_manifest["stop_reason"] = "max_levels_reached"
+        self._file_hierarchy_manifest = hierarchy_manifest
+
+        # Structural roots are the nodes that have not been consumed by a
+        # higher hierarchy level. They are deliberately distinct from the
+        # summaries chosen as thesis-generation input.
+        structural_roots = [
+            doc
+            for doc in all_nodes
+            if doc.metadata.get("node_type") == "cluster_summary" and not doc.metadata.get("parent_id")
+        ]
+        structural_roots = self._sort_hierarchy_documents(structural_roots)
+        if not structural_roots:
+            structural_roots = self._sort_hierarchy_documents(
+                [doc for doc in leaf_chunks if not doc.metadata.get("parent_id")]
+            ) or self._sort_hierarchy_documents(leaf_chunks)
+
+        thesis_inputs = latest_multi_summary_level or structural_roots or leaf_chunks
         if self.config.episode_thesis_reduce_with_llm:
             thesis_text = self.summarize_documents(thesis_inputs, self.thesis_chain, "episode thesis")
         else:
@@ -1157,7 +1452,8 @@ class PodcastRagPipeline:
                 "node_type": "episode_thesis",
                 "level": "episode",
                 "parent_id": None,
-                "child_ids": [doc.metadata["node_id"] for doc in thesis_inputs],
+                "child_ids": [doc.metadata["node_id"] for doc in structural_roots],
+                "generation_source_node_ids": [doc.metadata["node_id"] for doc in thesis_inputs],
                 "source": source,
                 "episode_id": leaf_chunks[0].metadata["episode_id"],
                 "episode_title": leaf_chunks[0].metadata["episode_title"],
@@ -1177,20 +1473,41 @@ class PodcastRagPipeline:
             },
         )
 
-        for doc in thesis_inputs:
+        for doc in structural_roots:
             doc.metadata["parent_id"] = thesis_doc.metadata["node_id"]
 
         all_nodes.append(thesis_doc)
         return all_nodes, thesis_doc
 
     def build_position_source_docs(self, all_nodes: list[Document], thesis_doc: Document) -> list[Document]:
-        candidates = [doc for doc in all_nodes if doc.metadata["node_type"] == "cluster_summary"]
+        levels = getattr(self, "_file_hierarchy_levels", {}) or {}
+        meaningful_levels = [level for level, docs in levels.items() if len(docs) >= 2]
+        candidate_levels: list[int] = []
+        if meaningful_levels:
+            deepest_meaningful = max(meaningful_levels)
+            candidate_levels.append(deepest_meaningful)
+            candidate_levels.extend(level for level in sorted(levels, reverse=True) if level < deepest_meaningful)
+        else:
+            candidate_levels = sorted(levels, reverse=True)
+
+        candidates: list[Document] = []
+        for level in candidate_levels:
+            level_docs = list(levels.get(level) or [])
+            # A forced singleton is useful for structural closure but is not a
+            # useful evidence budget sink when a deeper multi-summary level
+            # exists.
+            if meaningful_levels and len(level_docs) == 1 and level > max(meaningful_levels):
+                continue
+            candidates.extend(level_docs)
+        if not candidates:
+            candidates = [doc for doc in all_nodes if doc.metadata.get("node_type") == "cluster_summary"]
         candidates.sort(
             key=lambda doc: (
                 doc.metadata.get("speaker_scope") != "single",
                 doc.metadata.get("start_time") is None,
                 doc.metadata.get("start_time") or 0.0,
                 len(doc.page_content or ""),
+                str(doc.metadata.get("node_id") or ""),
             )
         )
 
@@ -1636,7 +1953,8 @@ class PodcastRagPipeline:
             "prompt_manifest": self.prompt_manifest,
             "token_maxima": self.performance.snapshot(),
             "fallback_count": getattr(self, "_file_fallback_count", 0),
-            "cluster_telemetry": self.cluster_telemetry,
+            "cluster_telemetry": list(getattr(self, "cluster_telemetry", []) or []),
+            "hierarchy_manifest": dict(getattr(self, "_file_hierarchy_manifest", {}) or {}),
             "validation": {
                 "counts": validation.counts,
                 "warnings": validation.warnings,
@@ -1656,6 +1974,7 @@ class PodcastRagPipeline:
                 "config_fingerprint": config_fingerprint(self.config),
                 "generation_config_fingerprint": generation_config_fingerprint(self.config),
                 "representations": representation_manifest,
+                "hierarchy_manifest": dict(getattr(self, "_file_hierarchy_manifest", {}) or {}),
             },
             "document_count": len(docs),
             "documents": document_payloads(docs, fingerprint, representation_builder),
@@ -1744,7 +2063,8 @@ class PodcastRagPipeline:
             if self.active_errata is not None:
                 self.active_errata.set_checkpoint_reuse(stage, False)
             return None
-        path = checkpoint_path(self.config, self.project_dir, source_path, fingerprint, stage)
+        checkpoint_namespace = getattr(self, "_active_checkpoint_namespace", None) or fingerprint
+        path = checkpoint_path(self.config, self.project_dir, source_path, checkpoint_namespace, stage)
         if not path.exists():
             if self.active_errata is not None:
                 self.active_errata.set_checkpoint_reuse(stage, False)
@@ -1784,6 +2104,17 @@ class PodcastRagPipeline:
             if self.active_errata is not None:
                 self.active_errata.set_checkpoint_reuse(stage, False)
             return None
+        if payload.get("checkpoint_namespace", fingerprint) != checkpoint_namespace:
+            self.record_diagnostic(
+                "checkpoint_namespace_mismatch",
+                "warning",
+                stage,
+                f"The {stage} checkpoint belongs to a different checkpoint namespace and was ignored.",
+                details={"path": str(path), "checkpoint_namespace": payload.get("checkpoint_namespace"), "expected_namespace": checkpoint_namespace},
+            )
+            if self.active_errata is not None:
+                self.active_errata.set_checkpoint_reuse(stage, False)
+            return None
         active_context = getattr(self, "active_context", None) or {}
         identity_mismatches = [
             {"field": key, "expected": active_context.get(key), "actual": payload.get(key)}
@@ -1814,6 +2145,16 @@ class PodcastRagPipeline:
                 self.active_errata.set_checkpoint_reuse(stage, False)
             return None
         print(f"  checkpoint reused: {stage} ({len(documents)} document(s))")
+        if stage == "hierarchy":
+            manifest = payload.get("hierarchy_manifest")
+            if isinstance(manifest, dict):
+                self._file_hierarchy_manifest = manifest
+            telemetry = payload.get("cluster_telemetry")
+            if isinstance(telemetry, list):
+                self.cluster_telemetry = list(telemetry)
+            fallback_count = payload.get("fallback_count")
+            if isinstance(fallback_count, int) and fallback_count >= 0:
+                self._file_fallback_count = fallback_count
         if self.active_errata is not None:
             self.active_errata.set_checkpoint_reuse(stage, True)
         self.record_diagnostic(
@@ -1828,7 +2169,8 @@ class PodcastRagPipeline:
     def save_file_checkpoint(self, source_path: Path, fingerprint: str, stage: str, docs: list[Document]) -> None:
         if not self.config.resume_within_file:
             return
-        path = checkpoint_path(self.config, self.project_dir, source_path, fingerprint, stage)
+        checkpoint_namespace = getattr(self, "_active_checkpoint_namespace", None) or fingerprint
+        path = checkpoint_path(self.config, self.project_dir, source_path, checkpoint_namespace, stage)
         active_context = getattr(self, "active_context", None) or {}
         write_json_file(
             path,
@@ -1837,6 +2179,10 @@ class PodcastRagPipeline:
                 "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
                 "source_path": str(source_path),
                 "source_fingerprint": fingerprint,
+                "checkpoint_namespace": checkpoint_namespace,
+                "hierarchy_manifest": dict(getattr(self, "_file_hierarchy_manifest", {}) or {}) if stage == "hierarchy" else None,
+                "cluster_telemetry": list(getattr(self, "cluster_telemetry", []) or []) if stage == "hierarchy" else None,
+                "fallback_count": getattr(self, "_file_fallback_count", 0) if stage == "hierarchy" else None,
                 **{
                     key: active_context[key]
                     for key in ("partition_id", "corpus_id", "handoff_id", "episode_id", "episode_uid", "correction_set_id", "selected_variant", "selected_transcript_artifact_sha256", "selected_transcript_canonical_payload_sha256", "source_audio_fingerprint")
@@ -1846,21 +2192,29 @@ class PodcastRagPipeline:
             },
         )
 
-    def clear_file_checkpoints(self, source_path: Path, fingerprint: str) -> None:
+    def clear_file_checkpoints(self, source_path: Path, fingerprint: str, checkpoint_namespace: str | None = None) -> None:
         if not self.config.resume_within_file:
             return
+        checkpoint_namespace = checkpoint_namespace or getattr(self, "_active_checkpoint_namespace", None) or fingerprint
         for stage in ("leaf_chunks", "hierarchy", "positions"):
-            path = checkpoint_path(self.config, self.project_dir, source_path, fingerprint, stage)
+            path = checkpoint_path(self.config, self.project_dir, source_path, checkpoint_namespace, stage)
             if path.exists():
                 path.unlink()
 
     def process_file(
-        self, path: Path, errata: ErrataRecorder | None = None, context: dict[str, Any] | None = None
+        self,
+        path: Path,
+        errata: ErrataRecorder | None = None,
+        context: dict[str, Any] | None = None,
+        *,
+        checkpoint_namespace: str | None = None,
     ) -> dict[str, Any]:
         previous_errata = self.active_errata
         previous_context = getattr(self, "active_context", None)
+        previous_checkpoint_namespace = getattr(self, "_active_checkpoint_namespace", None)
         self.active_errata = errata
         self.active_context = context
+        self._active_checkpoint_namespace = checkpoint_namespace
         try:
             return self._process_file(path)
         except PipelineInterrupted as exc:
@@ -1884,6 +2238,7 @@ class PodcastRagPipeline:
         finally:
             self.active_errata = previous_errata
             self.active_context = previous_context
+            self._active_checkpoint_namespace = previous_checkpoint_namespace
 
     @staticmethod
     def _apply_active_context(docs: list[Document], context: dict[str, Any]) -> None:
@@ -1921,6 +2276,9 @@ class PodcastRagPipeline:
         fingerprint = str(active_context.get("processing_key") or file_fingerprint(path))
         print(f"\nProcessing: {source}")
         self._file_fallback_count = 0
+        self.cluster_telemetry = []
+        self._file_hierarchy_manifest = {}
+        self._file_hierarchy_levels = {}
         self.performance.start_file(source)
         docs = load_transcript_json(path)
         if active_context:
@@ -1997,6 +2355,13 @@ class PodcastRagPipeline:
         else:
             all_nodes = hierarchy_checkpoint
             thesis_doc = next(doc for doc in all_nodes if doc.metadata.get("node_type") == "episode_thesis")
+            self._file_hierarchy_levels = {}
+            for doc in all_nodes:
+                if doc.metadata.get("node_type") != "cluster_summary":
+                    continue
+                match = re.fullmatch(r"summary_(\d+)", str(doc.metadata.get("level") or ""))
+                if match:
+                    self._file_hierarchy_levels.setdefault(int(match.group(1)), []).append(doc)
         if self.active_errata is not None:
             self.active_errata.update_metrics(
                 summaries=len([doc for doc in all_nodes if doc.metadata.get("node_type") == "cluster_summary"]),
@@ -2027,11 +2392,15 @@ class PodcastRagPipeline:
             )
         self.validate_documents_before_cache(all_nodes, source)
         elapsed = dt.timedelta(seconds=int(time.time() - start))
+        summary_count = len(
+            [doc for doc in all_nodes if doc.metadata.get("node_type") == "cluster_summary"]
+        )
+        position_count = len(position_docs)
 
         print(
             f"  Built {len(leaf_chunks)} leaf chunks, "
-            f"{len([doc for doc in all_nodes if doc.metadata['node_type'] == 'cluster_summary'])} cluster summaries, "
-            f"{len(position_docs)} position cards in {elapsed}"
+            f"{summary_count} cluster summaries, "
+            f"{position_count} position cards in {elapsed}"
         )
 
         self.performance.maybe_report("file complete", force=True)
@@ -2041,7 +2410,10 @@ class PodcastRagPipeline:
             "status": "completed",
             "source": "llm_processing",
             "nodes": len(all_nodes),
-            "position_cards": len(position_docs),
+            "leaf_chunks": len(leaf_chunks),
+            "summaries": summary_count,
+            "positions": position_count,
+            "position_cards": position_count,
             "elapsed_seconds": int(time.time() - start),
             "fallbacks": getattr(self, "_file_fallback_count", 0),
             "documents": all_nodes,

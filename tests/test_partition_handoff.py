@@ -8,6 +8,7 @@ from unittest.mock import patch
 from podcast_rag.config import PipelineConfig
 from podcast_rag.handoff import HandoffError, canonical_payload, validate_handoff, validate_release_manifest
 from podcast_rag.partitions import PartitionError, PartitionRegistry, PartitionSpec, effective_partition_config, processing_key
+from podcast_rag.runtime import PIPELINE_VERSION, PROMPT_VERSION
 from podcast_rag import cli
 
 
@@ -103,6 +104,24 @@ class PartitionAndHandoffTests(unittest.TestCase):
         one = processing_key(base, config_fingerprint="c", generation_fingerprint="g", representation_fingerprint="r")
         other = processing_key({**base, "partition_id": "two", "episode_uid": "two:same"}, config_fingerprint="c", generation_fingerprint="g", representation_fingerprint="r")
         self.assertNotEqual(one, other)
+
+    def test_processing_key_changes_when_pipeline_or_prompt_version_changes(self):
+        base = {
+            "partition_id": "one",
+            "episode_id": "same",
+            "episode_uid": "one:same",
+            "handoff_id": "h1",
+            "selected_transcript_artifact_sha256": "a",
+            "selected_transcript_canonical_payload_sha256": "b",
+            "source_audio_fingerprint": "c",
+            "pipeline_version": PIPELINE_VERSION,
+            "prompt_manifest": PROMPT_VERSION,
+        }
+        current = processing_key(base, config_fingerprint="c", generation_fingerprint="g", representation_fingerprint="r")
+        old_pipeline = processing_key({**base, "pipeline_version": "0.3.0"}, config_fingerprint="c", generation_fingerprint="g", representation_fingerprint="r")
+        old_prompt = processing_key({**base, "prompt_manifest": "2026-05-12"}, config_fingerprint="c", generation_fingerprint="g", representation_fingerprint="r")
+        self.assertNotEqual(current, old_pipeline)
+        self.assertNotEqual(current, old_prompt)
 
     def test_approved_correction_is_applied_only_to_consumer_view(self):
         with tempfile.TemporaryDirectory() as directory:

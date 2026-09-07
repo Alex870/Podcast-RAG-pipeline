@@ -102,7 +102,7 @@ function Test-WritableDirectory {
 function Invoke-CondaPython {
     param([string[]]$Arguments)
 
-    & conda run --no-capture-output -n $CondaEnvName python @Arguments
+    & conda run --no-capture-output -n $CondaEnvName python -u @Arguments
     return $LASTEXITCODE
 }
 

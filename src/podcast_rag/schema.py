@@ -192,6 +192,23 @@ def validate_processed_documents(items: list[Any], require_provenance: bool = Fa
             if isinstance(child_id, str) and child_id:
                 child_refs.append((node_id, child_id))
 
+        generation_refs = metadata.get("generation_source_node_ids")
+        if generation_refs is not None:
+            if not isinstance(generation_refs, list):
+                add_error(
+                    f"{label} has non-array generation_source_node_ids",
+                    code="invalid_generation_source_references",
+                    node_id=node_id,
+                )
+            else:
+                for generation_id in generation_refs:
+                    if not isinstance(generation_id, str) or not generation_id:
+                        add_error(
+                            f"{label} has an invalid generation source reference",
+                            code="invalid_generation_source_reference",
+                            node_id=node_id,
+                        )
+
     missing_types = REQUIRED_NODE_TYPES.difference(counts)
     for node_type in sorted(missing_types):
         add_error(
@@ -209,6 +226,19 @@ def validate_processed_documents(items: list[Any], require_provenance: bool = Fa
                 node_id=parent_id,
                 evidence_path=[parent_id, child_id],
             )
+
+    for item in normalized:
+        metadata = item["metadata"]
+        node_id = str(metadata.get("node_id") or "")
+        generation_refs = metadata.get("generation_source_node_ids")
+        for generation_id in generation_refs if isinstance(generation_refs, list) else []:
+            if isinstance(generation_id, str) and generation_id not in node_ids:
+                add_error(
+                    f"{node_id} references missing generation source node {generation_id}",
+                    code="missing_generation_source_reference",
+                    node_id=node_id,
+                    evidence_path=[node_id, generation_id],
+                )
 
     if require_provenance:
         by_id = {str(item["metadata"].get("node_id")): item["metadata"] for item in normalized}
@@ -340,6 +370,15 @@ def validate_processed_cache(payload: Any) -> ValidationResult:
     elif representations is not None and not isinstance(representations, dict):
         warnings.append("cache representations manifest is not an object")
 
+    hierarchy_manifest = payload.get("hierarchy_manifest")
+    if hierarchy_manifest is not None:
+        if not isinstance(hierarchy_manifest, dict):
+            errors.append("cache hierarchy_manifest must be an object when present")
+            issues.append({"code": "invalid_hierarchy_manifest", "message": errors[-1]})
+        elif hierarchy_manifest.get("levels") is not None and not isinstance(hierarchy_manifest.get("levels"), list):
+            errors.append("cache hierarchy_manifest.levels must be an array when present")
+            issues.append({"code": "invalid_hierarchy_manifest_levels", "message": errors[-1]})
+
     return ValidationResult(not errors, errors, warnings, document_result.counts, issues)
 
 
@@ -350,6 +389,8 @@ def schema_summary() -> dict[str, Any]:
         "required_node_types": sorted(REQUIRED_NODE_TYPES),
         "required_metadata_fields": sorted(REQUIRED_METADATA_FIELDS),
         "summary_node_types": sorted(SUMMARY_NODE_TYPES),
+        "optional_metadata_fields": ["generation_source_node_ids"],
+        "cache_manifests": ["representations", "hierarchy_manifest"],
     }
 
 

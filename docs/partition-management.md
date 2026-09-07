@@ -37,6 +37,30 @@ The guided menu also collects optional owner, tags, privacy, and retention
 metadata.  Automation can supply repeated `--tag` options, plus
 `--privacy key=value` and `--retention key=value` options.
 
+## Guided Windows workflow
+
+From the project directory, start the main launcher without parameters:
+
+```powershell
+.\Run Podcast RAG Pipeline.ps1
+```
+
+Choose `2` for the partition management center, or choose `1` to process or
+resume a partition immediately.  The menu uses friendly names and numbered
+choices, so the long immutable partition ID does not need to be typed.
+
+The normal processing action is **Process / resume**.  It validates the
+partition's handoff packages, skips valid completed caches, reuses valid
+within-file checkpoints, and retries failed or interrupted episodes.  The
+menu also offers a next-episode action, targeted episode processing, and an
+explicitly confirmed force-rebuild action.
+
+The status dashboard reports declared episodes, completed/cached work,
+pending work, failed or interrupted work, quarantined episodes, and invalid
+handoff packages.  A partition with an active run lock is not started a
+second time.  Stop requests and live concurrency changes target the selected
+partition's `state` directory rather than the legacy root state directory.
+
 ## Publish and process a handoff
 
 The upstream generator should stage a complete package and atomically promote
@@ -48,6 +72,12 @@ podcast-rag handoff validate --manifest .\partitions\podcast-history\handoff_inb
 podcast-rag handoff scan --manifest .\partitions\podcast-history\handoff_inbox
 podcast-rag process --partition podcast-history
 podcast-rag process --manifest .\partitions\podcast-history\handoff_inbox\handoff-01\manifest.json --episode podcast-2026-01-03
+```
+
+The PowerShell launcher equivalent for scripted managed processing is:
+
+```powershell
+.\scripts\Run-PodcastRagPipeline.ps1 -Managed -Partition podcast-history
 ```
 
 Validation is dependency-free and checks package-relative paths, hashes,

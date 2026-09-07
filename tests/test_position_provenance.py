@@ -4,7 +4,7 @@ from podcast_rag.pipeline import PodcastRagPipeline
 from podcast_rag.schema import validate_processed_documents
 
 
-def node(node_id, node_type, child_ids=None, parent_id=None):
+def node(node_id, node_type, child_ids=None, parent_id=None, generation_source_node_ids=None):
     metadata = {
         "node_id": node_id,
         "node_type": node_type,
@@ -18,6 +18,8 @@ def node(node_id, node_type, child_ids=None, parent_id=None):
         "parent_id": parent_id,
         "child_ids": list(child_ids or []),
     }
+    if generation_source_node_ids is not None:
+        metadata["generation_source_node_ids"] = list(generation_source_node_ids)
     if node_type == "leaf_chunk":
         metadata["source_segment_ids"] = [f"episode-1:segment:{node_id}"]
     if node_type == "position_card":
@@ -119,6 +121,30 @@ class PositionProvenanceTests(unittest.TestCase):
             any("references missing child_id missing" in error for error in result.errors),
             result.errors,
         )
+
+    def test_thesis_generation_sources_are_references_not_structural_edges(self):
+        docs = [
+            node("leaf_1", "leaf_chunk", parent_id="summary_1"),
+            node("summary_1", "cluster_summary", ["leaf_1"], "thesis_1"),
+            node("leaf_2", "leaf_chunk", parent_id="summary_2"),
+            node("summary_2", "cluster_summary", ["leaf_2"], None),
+            node("thesis_1", "episode_thesis", ["summary_1"], generation_source_node_ids=["summary_2"]),
+        ]
+
+        result = validate_processed_documents(docs, require_provenance=True)
+
+        self.assertTrue(result.valid, result.errors)
+
+    def test_missing_thesis_generation_source_is_rejected(self):
+        docs = [
+            node("leaf_1", "leaf_chunk", parent_id="thesis_1"),
+            node("thesis_1", "episode_thesis", ["leaf_1"], generation_source_node_ids=["missing"]),
+        ]
+
+        result = validate_processed_documents(docs, require_provenance=True)
+
+        self.assertFalse(result.valid)
+        self.assertTrue(any(issue["code"] == "missing_generation_source_reference" for issue in result.issues))
 
     def test_checkpointed_position_without_valid_evidence_is_dropped(self):
         valid = StubDocument(

@@ -78,6 +78,10 @@ class ErrataTests(unittest.TestCase):
             prompt = pipeline.prompt_manifest["summary_system"]
             self.assertIn("historical source metadata", prompt)
             self.assertIn("never refuse or defer summarization", prompt)
+            self.assertIn("historical source metadata", pipeline.prompt_manifest["thesis_system"])
+            self.assertIn("{retry_instruction}", pipeline.prompt_manifest["summary_user"])
+            self.assertIn("{retry_instruction}", pipeline.prompt_manifest["thesis_user"])
+            self.assertEqual("missing_context_response", pipeline.prompt_manifest["retry_behavior"]["trigger"])
 
     def test_missing_context_retry_adds_date_correction(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -100,8 +104,9 @@ class ErrataTests(unittest.TestCase):
 
             self.assertIn("supplied historical episode material", result)
             self.assertEqual(2, len(chain.calls))
-            self.assertIn("CORRECTION", chain.calls[1]["text"])
-            self.assertIn("historical metadata", chain.calls[1]["text"])
+            self.assertEqual(chain.calls[0]["text"], chain.calls[1]["text"])
+            self.assertIn("CORRECTION", chain.calls[1]["retry_instruction"])
+            self.assertIn("historical metadata", chain.calls[1]["retry_instruction"])
             self.assertEqual(0, pipeline.fallback_count)
 
     def test_persistent_missing_context_stops_after_one_corrective_retry(self):
@@ -177,7 +182,7 @@ class ErrataTests(unittest.TestCase):
             pipeline.performance = FakePerformance()
             pipeline.fallback_count = 0
             pipeline._file_fallback_count = 0
-            pipeline.cluster_telemetry = []
+            pipeline.cluster_telemetry = [{"file": "stale"}]
             pipeline.prompt_manifest = {}
             pipeline.active_errata = None
             pipeline.active_context = None
@@ -192,6 +197,7 @@ class ErrataTests(unittest.TestCase):
             def build_hierarchy(docs, source):
                 nonlocal process_calls
                 process_calls += 1
+                pipeline.cluster_telemetry.append({"file": process_calls})
                 if process_calls == 1:
                     pipeline._record_fallback()
                 return [leaf, summary, thesis], thesis
@@ -208,10 +214,18 @@ class ErrataTests(unittest.TestCase):
                 pipeline.save_cached_documents(second_cache, second_source, "second-fingerprint", second_result["documents"])
 
             self.assertEqual(1, first_result["fallbacks"])
+            self.assertEqual(1, first_result["leaf_chunks"])
+            self.assertEqual(1, first_result["summaries"])
+            self.assertEqual(0, first_result["positions"])
             self.assertEqual(0, second_result["fallbacks"])
+            self.assertEqual(1, second_result["leaf_chunks"])
+            self.assertEqual(1, second_result["summaries"])
+            self.assertEqual(0, second_result["positions"])
             self.assertEqual(1, pipeline.fallback_count)
             self.assertEqual(1, json.loads(first_cache.read_text(encoding="utf-8"))["fallback_count"])
             self.assertEqual(0, json.loads(second_cache.read_text(encoding="utf-8"))["fallback_count"])
+            self.assertEqual([{"file": 1}], json.loads(first_cache.read_text(encoding="utf-8"))["cluster_telemetry"])
+            self.assertEqual([{"file": 2}], json.loads(second_cache.read_text(encoding="utf-8"))["cluster_telemetry"])
 
     def test_batch_boundary_writes_errata_after_success(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -317,12 +331,14 @@ class ErrataTests(unittest.TestCase):
                     self.active_context = None
                     self.clear_calls = 0
                     self.process_calls = 0
+                    self.checkpoint_namespaces = []
 
                 def clear_file_checkpoints(self, *args):
                     self.clear_calls += 1
 
-                def process_file(self, path, errata=None, context=None):
+                def process_file(self, path, errata=None, context=None, *, checkpoint_namespace=None):
                     self.process_calls += 1
+                    self.checkpoint_namespaces.append(checkpoint_namespace)
                     return {
                         "status": "completed",
                         "source": "test",
@@ -346,11 +362,71 @@ class ErrataTests(unittest.TestCase):
 
             self.assertEqual(0, result)
             self.assertEqual(1, pipeline.process_calls)
-            self.assertEqual(1, pipeline.clear_calls)
+            self.assertEqual(0, pipeline.clear_calls)
+            self.assertTrue(pipeline.checkpoint_namespaces[0].startswith(fingerprint + ".force."))
             self.assertEqual("after", json.loads(cache_path.read_text(encoding="utf-8"))["version"])
             backups = list((root / "state" / "reprocess_backups").rglob(cache_path.name))
             self.assertEqual(1, len(backups))
             self.assertEqual("before", json.loads(backups[0].read_text(encoding="utf-8"))["version"])
+            manifest_path = next((root / "state" / "reprocess_backups").rglob("manifest.json"))
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual("completed", manifest["promotion_status"])
+            self.assertTrue(manifest["artifacts"]["cache"]["present"])
+            self.assertEqual(
+                manifest["artifacts"]["cache"]["sha256"],
+                __import__("hashlib").sha256(backups[0].read_bytes()).hexdigest(),
+            )
+
+    def test_failed_force_reprocess_restores_canonical_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "episode_speaker_transcript.json"
+            source.write_text("transcript", encoding="utf-8")
+            config = PipelineConfig(
+                input_dir="input",
+                processed_data_dir="processed_data",
+                state_path="state/state.json",
+                stop_file="state/stop.txt",
+                control_file="state/control.json",
+                run_snapshot_path="state/snapshot.json",
+                run_report_dir="state/reports",
+                fake_llm=True,
+                verify_model=False,
+                test_inference=False,
+                errata_enabled=False,
+                auto_refresh_topic_index=False,
+                resume_within_file=False,
+            )
+            fingerprint = cli.file_fingerprint(source)
+            cache_path = cli.processed_data_cache_path(root / config.processed_data_dir, fingerprint, source)
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_text('{"version": "canonical"}', encoding="utf-8")
+
+            class FailingPipeline:
+                def __init__(self):
+                    self.performance = PerformanceTracker(30)
+                    self.fallback_count = 0
+                    self.active_context = None
+
+                def process_file(self, path, errata=None, context=None, *, checkpoint_namespace=None):
+                    raise RuntimeError("forced rebuild failed")
+
+                def clear_file_checkpoints(self, *args):
+                    return None
+
+            with patch.object(cli.runtime, "load_runtime_deps"), patch.object(cli, "_make_pipeline", return_value=FailingPipeline()):
+                with self.assertRaises(RuntimeError):
+                    cli.run_batch(
+                        config,
+                        root,
+                        one_file=True,
+                        input_files=[(source, None)],
+                        force_reprocess=True,
+                    )
+
+            self.assertEqual("canonical", json.loads(cache_path.read_text(encoding="utf-8"))["version"])
+            manifest_path = next((root / "state" / "reprocess_backups").rglob("manifest.json"))
+            self.assertEqual("rolled_back", json.loads(manifest_path.read_text(encoding="utf-8"))["promotion_status"])
 
     def test_clean_success_writes_valid_paired_artifacts_without_diagnosis(self):
         with tempfile.TemporaryDirectory() as directory:

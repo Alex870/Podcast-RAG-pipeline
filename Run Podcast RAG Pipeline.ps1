@@ -1,18 +1,13 @@
 param(
     [ValidateSet("Prompt", "Run", "Debug", "CacheCheck", "SetControl", "CreateStopFile", "ClearStopFile", "CreateCondaEnv", "BuildTopicIndex", "Migrate", "Partitions")]
     [string]$Action = "Prompt",
-    [int]$MaxParallelModelRequests
+    [int]$MaxParallelModelRequests,
+    [string]$Config = "",
+    [string]$CondaEnvName = "podcast-rag-pipeline"
 )
-
-function Wait-ForExitPrompt {
-    if (-not $env:PODCAST_RAG_SUPPRESS_PAUSE -and $Host.Name -eq "ConsoleHost") {
-        [void](Read-Host "Press Enter to continue")
-    }
-}
 
 function Exit-Script {
     param([int]$Code = 0)
-    Wait-ForExitPrompt
     exit $Code
 }
 
@@ -55,6 +50,119 @@ function Invoke-LauncherScript {
     Exit-Script $childExitCode
 }
 
+function Invoke-InteractiveChild {
+    param(
+        [string]$Path,
+        [hashtable]$Parameters = @{}
+    )
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        Write-Error "Missing launcher script: $Path"
+        return 1
+    }
+
+    $previousSuppressPause = $env:PODCAST_RAG_SUPPRESS_PAUSE
+    $env:PODCAST_RAG_SUPPRESS_PAUSE = "1"
+    try {
+        & $Path @Parameters
+        $childExitCode = $LASTEXITCODE
+    } finally {
+        if ($null -eq $previousSuppressPause) {
+            Remove-Item Env:PODCAST_RAG_SUPPRESS_PAUSE -ErrorAction SilentlyContinue
+        } else {
+            $env:PODCAST_RAG_SUPPRESS_PAUSE = $previousSuppressPause
+        }
+    }
+    if ($null -eq $childExitCode) { return 0 }
+    return $childExitCode
+}
+
+function Pause-InteractiveMenu {
+    [void](Read-Host "Press Enter to return to the main menu")
+}
+
+function Invoke-MaintenanceMenu {
+    while ($true) {
+        Write-Host ""
+        Write-Host "Maintenance" -ForegroundColor Cyan
+        Write-Host "  1. Check legacy/default processed-cache health"
+        Write-Host "  2. Build or refresh the legacy/default topic index"
+        Write-Host "  Q. Back"
+        $selection = (Read-Host "Choose an action").Trim().ToUpperInvariant()
+        switch ($selection) {
+            "1" {
+                [void](Invoke-InteractiveChild -Path $CacheScript -Parameters @{ Config = $Config })
+                Pause-InteractiveMenu
+            }
+            "2" {
+                [void](Invoke-InteractiveChild -Path $RunScript -Parameters @{ Config = $Config; CondaEnvName = $CondaEnvName; BuildTopicIndex = $true })
+                Pause-InteractiveMenu
+            }
+            "Q" { return }
+            default { Write-Host "Please choose one of the displayed actions." -ForegroundColor Yellow }
+        }
+    }
+}
+
+function Start-InteractiveMenu {
+    while ($true) {
+        Write-Host ""
+        Write-Host "Podcast RAG Pipeline" -ForegroundColor Cyan
+        Write-Host "Partition-first interactive menu"
+        Write-Host "  1. Process / resume pending partition work"
+        Write-Host "  2. Manage partitions"
+        Write-Host "  3. View partition status"
+        Write-Host "  4. Control a running partition"
+        Write-Host "  5. Validate the environment"
+        Write-Host "  6. Create or refresh the Conda environment"
+        Write-Host "  7. Cache and topic maintenance"
+        Write-Host "  8. Advanced legacy flat-input processing"
+        Write-Host "  9. Migrate legacy settings and state"
+        Write-Host "  Q. Quit"
+        $selection = (Read-Host "Choose an action").Trim().ToUpperInvariant()
+        switch ($selection) {
+            "1" {
+                $childExitCode = Invoke-InteractiveChild -Path $PartitionScript -Parameters @{ Config = $Config; CondaEnvName = $CondaEnvName; Mode = "Process" }
+                if ($childExitCode -eq 130) { return }
+                Pause-InteractiveMenu
+            }
+            "2" {
+                [void](Invoke-InteractiveChild -Path $PartitionScript -Parameters @{ Config = $Config; CondaEnvName = $CondaEnvName; Mode = "Menu" })
+            }
+            "3" {
+                [void](Invoke-InteractiveChild -Path $PartitionScript -Parameters @{ Config = $Config; CondaEnvName = $CondaEnvName; Mode = "Status" })
+                Pause-InteractiveMenu
+            }
+            "4" {
+                [void](Invoke-InteractiveChild -Path $PartitionScript -Parameters @{ Config = $Config; CondaEnvName = $CondaEnvName; Mode = "Control" })
+                Pause-InteractiveMenu
+            }
+            "5" {
+                [void](Invoke-InteractiveChild -Path $DebugScript -Parameters @{ Config = $Config; CondaEnvName = $CondaEnvName })
+                Pause-InteractiveMenu
+            }
+            "6" {
+                [void](Invoke-InteractiveChild -Path $RunScript -Parameters @{ Config = $Config; CondaEnvName = $CondaEnvName; CreateCondaEnv = $true })
+                Pause-InteractiveMenu
+            }
+            "7" { Invoke-MaintenanceMenu }
+            "8" {
+                Write-Host ""
+                Write-Host "Legacy flat-input processing uses the configured input_dir and state paths." -ForegroundColor Yellow
+                $childExitCode = Invoke-InteractiveChild -Path $RunScript -Parameters @{ Config = $Config; CondaEnvName = $CondaEnvName }
+                if ($childExitCode -eq 130) { return }
+                Pause-InteractiveMenu
+            }
+            "9" {
+                [void](Invoke-InteractiveChild -Path $MigrationScript -Parameters @{})
+                Pause-InteractiveMenu
+            }
+            "Q" { return }
+            default { Write-Host "Please choose one of the displayed actions." -ForegroundColor Yellow }
+        }
+    }
+}
+
 function Read-PositiveInteger {
     param(
         [string]$Prompt
@@ -70,74 +178,43 @@ function Read-PositiveInteger {
 }
 
 if ($Action -eq "Prompt") {
-    Write-Host ""
-    Write-Host "Podcast RAG Pipeline"
-    Write-Host "Choose what to run:"
-    Write-Host "  1. Run environment validation"
-    Write-Host "  2. Run the main RAG pipeline"
-    Write-Host "  3. Check processed-data cache health"
-    Write-Host "  4. Set live max_parallel_model_requests"
-    Write-Host "  5. Create stop-after-current-file request"
-    Write-Host "  6. Clear stop-after-current-file request"
-    Write-Host "  7. Create or refresh the Conda environment"
-    Write-Host "  8. Build or refresh the topic index"
-    Write-Host "  9. Migrate settings and state from a legacy directory"
-    Write-Host "  10. Manage processing partitions"
-    Write-Host "  Q. Quit"
-    $selection = (Read-Host "Enter 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, or Q").Trim()
-
-    switch ($selection.ToUpperInvariant()) {
-        "1" { $Action = "Debug" }
-        "2" { $Action = "Run" }
-        "3" { $Action = "CacheCheck" }
-        "4" { $Action = "SetControl" }
-        "5" { $Action = "CreateStopFile" }
-        "6" { $Action = "ClearStopFile" }
-        "7" { $Action = "CreateCondaEnv" }
-        "8" { $Action = "BuildTopicIndex" }
-        "9" { $Action = "Migrate" }
-        "10" { $Action = "Partitions" }
-        "Q" { Exit-Script 0 }
-        default {
-            Write-Host "Unrecognized selection. Exiting."
-            Exit-Script 1
-        }
-    }
+    Start-InteractiveMenu
+    Exit-Script 0
 }
 
 switch ($Action) {
     "Debug" {
-        Invoke-LauncherScript -Path $DebugScript
+        Invoke-LauncherScript -Path $DebugScript -Parameters @{ Config = $Config; CondaEnvName = $CondaEnvName }
     }
     "Run" {
-        Invoke-LauncherScript -Path $RunScript
+        Invoke-LauncherScript -Path $RunScript -Parameters @{ Config = $Config; CondaEnvName = $CondaEnvName }
     }
     "CacheCheck" {
-        Invoke-LauncherScript -Path $CacheScript
+        Invoke-LauncherScript -Path $CacheScript -Parameters @{ Config = $Config }
     }
     "SetControl" {
         if (-not $MaxParallelModelRequests -or $MaxParallelModelRequests -lt 1) {
             $MaxParallelModelRequests = Read-PositiveInteger -Prompt "Enter max_parallel_model_requests"
         }
-        Invoke-LauncherScript -Path $ControlScript -Parameters @{ MaxParallelModelRequests = $MaxParallelModelRequests }
+        Invoke-LauncherScript -Path $ControlScript -Parameters @{ Config = $Config; MaxParallelModelRequests = $MaxParallelModelRequests }
     }
     "CreateStopFile" {
-        Invoke-LauncherScript -Path $RunScript -Parameters @{ CreateStopFile = $true }
+        Invoke-LauncherScript -Path $RunScript -Parameters @{ Config = $Config; CondaEnvName = $CondaEnvName; CreateStopFile = $true }
     }
     "ClearStopFile" {
-        Invoke-LauncherScript -Path $RunScript -Parameters @{ ClearStopFile = $true }
+        Invoke-LauncherScript -Path $RunScript -Parameters @{ Config = $Config; CondaEnvName = $CondaEnvName; ClearStopFile = $true }
     }
     "CreateCondaEnv" {
-        Invoke-LauncherScript -Path $RunScript -Parameters @{ CreateCondaEnv = $true }
+        Invoke-LauncherScript -Path $RunScript -Parameters @{ Config = $Config; CondaEnvName = $CondaEnvName; CreateCondaEnv = $true }
     }
     "BuildTopicIndex" {
-        Invoke-LauncherScript -Path $RunScript -Parameters @{ BuildTopicIndex = $true }
+        Invoke-LauncherScript -Path $RunScript -Parameters @{ Config = $Config; CondaEnvName = $CondaEnvName; BuildTopicIndex = $true }
     }
     "Migrate" {
         Invoke-LauncherScript -Path $MigrationScript
     }
     "Partitions" {
-        Invoke-LauncherScript -Path $PartitionScript
+        Invoke-LauncherScript -Path $PartitionScript -Parameters @{ Config = $Config; CondaEnvName = $CondaEnvName; Mode = "Menu" }
     }
 }
 

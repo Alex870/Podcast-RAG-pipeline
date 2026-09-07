@@ -7,6 +7,7 @@ import json
 import re
 import signal
 import shutil
+import sys
 import time
 import uuid
 from collections import Counter
@@ -14,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 import podcast_rag.runtime as runtime
-from podcast_rag.config import PipelineConfig, apply_env_overrides, load_config, resolve_path
+from podcast_rag.config import PipelineConfig, apply_env_overrides, embedding_constructor_kwargs, load_config, resolve_path
 from podcast_rag.evaluation import evaluate_retrieval_run
 from podcast_rag.errata import ErrataRecorder, errata_json_paths, validate_errata_payload, write_errata_artifacts
 from podcast_rag.llm_support import test_model_inference, verify_model_available
@@ -70,6 +71,21 @@ from podcast_rag.representations import RepresentationBuilder
 from podcast_rag.config import config_fingerprint, generation_config_fingerprint
 
 
+def configure_console_output() -> None:
+    """Make progress visible when Python stdout is connected to a pipe.
+
+    The managed PowerShell launchers request live Conda output, but Python can
+    still block-buffer stdout when it is not attached directly to a terminal.
+    Keep progress lines observable for both launcher and direct entry-point
+    invocations while tolerating redirected or custom streams.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(line_buffering=True, write_through=True)
+        except (AttributeError, ValueError):
+            pass
+
+
 def finalize_file_errata(
     pipeline: PodcastRagPipeline,
     recorder: ErrataRecorder | None,
@@ -78,6 +94,13 @@ def finalize_file_errata(
     """Finalize advisory diagnosis and persist paired per-file artifacts."""
     if recorder is None:
         return None
+    # Diagnosis is advisory and must not be able to rewrite the deterministic
+    # file result, even if a model or test double behaves unexpectedly.
+    outcome_snapshot = (
+        recorder.outcome_status,
+        recorder.failed_stage,
+        dict(recorder.exception) if recorder.exception else None,
+    )
     try:
         pipeline.diagnose_errata(recorder)
     except Exception as exc:
@@ -88,9 +111,10 @@ def finalize_file_errata(
             "warning",
             "errata",
             "The advisory diagnosis stage raised an unexpected exception.",
-            details={"error_type": type(exc).__name__, "error": str(exc)},
+            details={"error_type": type(exc).__name__, "error": str(exc)[:500]},
         )
-        recorder.set_diagnosis({"status": "failed", "error": f"{type(exc).__name__}: {exc}"})
+        recorder.set_diagnosis({"status": "failed", "error": f"{type(exc).__name__}: {str(exc)[:500]}"})
+    recorder.outcome_status, recorder.failed_stage, recorder.exception = outcome_snapshot
     try:
         return write_errata_artifacts(recorder, errata_dir)
     except Exception as exc:
@@ -111,22 +135,121 @@ def _backup_reprocess_artifacts(
     recorder: ErrataRecorder | None,
     state_path: Path,
     run_id: str,
+    *,
+    processed_data_dir: Path | None = None,
+    source_path: Path | None = None,
+    episode_id: str | None = None,
+    processing_key: str | None = None,
+    previous_state: dict[str, Any] | None = None,
 ) -> dict[str, str]:
-    """Copy the selected episode's current artifacts before a forced rebuild."""
+    """Snapshot the selected episode's artifacts before a forced rebuild."""
     backup_root = state_path.parent / "reprocess_backups" / run_id
+    backup_root.mkdir(parents=True, exist_ok=True)
     backup_paths: dict[str, str] = {}
     candidates: list[tuple[str, Path]] = [("cache", cache_path)]
+    superseded_cache_paths: list[str] = []
+    if processed_data_dir is not None and processed_data_dir.is_dir():
+        safe_stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", (source_path or cache_path).stem).strip("._") or "transcript"
+        for candidate in sorted(processed_data_dir.glob(f"{safe_stem}.*.processed_documents.json")):
+            if candidate.resolve() == cache_path.resolve():
+                continue
+            try:
+                candidate_payload = read_json_file(candidate)
+            except Exception:
+                continue
+            candidate_episode_id = candidate_payload.get("episode_id")
+            if not candidate_episode_id:
+                candidate_documents = candidate_payload.get("documents") or []
+                if candidate_documents and isinstance(candidate_documents[0], dict):
+                    candidate_episode_id = (candidate_documents[0].get("metadata") or {}).get("episode_id")
+            if episode_id and candidate_episode_id not in (None, "", episode_id):
+                continue
+            superseded_cache_paths.append(str(candidate))
+            candidates.append((f"superseded_cache_{len(superseded_cache_paths)}", candidate))
     if recorder is not None:
         json_path, markdown_path = _errata_artifact_paths(errata_dir, recorder)
         candidates.extend([("errata_json", json_path), ("errata_markdown", markdown_path)])
+    artifacts: dict[str, dict[str, Any]] = {}
     for label, source in candidates:
-        if not source.is_file():
-            continue
-        destination = backup_root / label / source.name
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, destination)
-        backup_paths[label] = str(destination)
+        entry: dict[str, Any] = {
+            "original_path": str(source),
+            "present": source.is_file(),
+            "backup_path": None,
+            "sha256": None,
+            "size": None,
+        }
+        if source.is_file():
+            destination = backup_root / label / source.name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            temporary = destination.with_suffix(destination.suffix + ".tmp")
+            shutil.copy2(source, temporary)
+            temporary.replace(destination)
+            entry.update(
+                {
+                    "backup_path": str(destination),
+                    "sha256": hashlib.sha256(destination.read_bytes()).hexdigest(),
+                    "size": destination.stat().st_size,
+                }
+            )
+            backup_paths[label] = str(destination)
+        artifacts[label] = entry
+
+    manifest_path = backup_root / "manifest.json"
+    manifest = {
+        "run_id": run_id,
+        "episode_id": episode_id,
+        "processing_key": processing_key,
+        "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "state_path": str(state_path),
+        "previous_state": previous_state or {},
+        "superseded_cache_paths": superseded_cache_paths,
+        "artifacts": artifacts,
+        "replacement_status": {label: "pending" for label, _source in candidates},
+        "promotion_status": "prepared",
+    }
+    write_json_file(manifest_path, manifest)
+    backup_paths["manifest_path"] = str(manifest_path)
     return backup_paths
+
+
+def _update_reprocess_manifest(backup_paths: dict[str, str], **updates: Any) -> None:
+    manifest_path = Path(backup_paths.get("manifest_path", ""))
+    if not manifest_path.is_file():
+        return
+    manifest = read_json_file(manifest_path)
+    for key, value in updates.items():
+        if isinstance(value, dict) and isinstance(manifest.get(key), dict):
+            manifest[key].update(value)
+        else:
+            manifest[key] = value
+    write_json_file(manifest_path, manifest)
+
+
+def _restore_reprocess_artifacts(backup_paths: dict[str, str]) -> None:
+    """Restore the exact pre-run artifact set using same-directory replacement."""
+    manifest_path = Path(backup_paths.get("manifest_path", ""))
+    if not manifest_path.is_file():
+        return
+    manifest = read_json_file(manifest_path)
+    for label, entry in (manifest.get("artifacts") or {}).items():
+        if str(label).startswith("superseded_cache_"):
+            # These are historical versioned caches. The forced run never
+            # promotes over them, so rollback must leave them byte-for-byte
+            # untouched as comparison and recovery sources.
+            manifest.setdefault("replacement_status", {})[label] = "preserved"
+            continue
+        original = Path(str(entry.get("original_path") or ""))
+        backup = Path(str(entry.get("backup_path") or ""))
+        if entry.get("present") and backup.is_file():
+            temporary = original.with_suffix(original.suffix + ".rollback.tmp")
+            temporary.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(backup, temporary)
+            temporary.replace(original)
+        elif not entry.get("present"):
+            original.unlink(missing_ok=True)
+        manifest.setdefault("replacement_status", {})[label] = "restored"
+    manifest["promotion_status"] = "rolled_back"
+    write_json_file(manifest_path, manifest)
 
 
 def inspect_errata(config: PipelineConfig, project_dir: Path, selected: str | None) -> int:
@@ -779,6 +902,14 @@ def run_batch(
         return 0
 
     cached_pending = [processed_data_cache_path(processed_data_dir, fingerprint, path).exists() for path, fingerprint, _context in pending]
+    # Cached files still need lightweight validation, but they are not new
+    # processing work and must not influence the model-processing ETA.
+    processing_work_keys = {
+        fingerprint
+        for (_path, fingerprint, _context), has_cache in zip(pending, cached_pending)
+        if force_reprocess or not has_cache
+    }
+    processing_work_total = len(processing_work_keys)
     needs_llm_processing = force_reprocess or not all(cached_pending)
     if needs_llm_processing:
         if config.fake_llm:
@@ -791,8 +922,8 @@ def run_batch(
         print("All pending files have processed data caches; skipping LM Studio model verification.")
 
     pipeline = _make_pipeline(config, project_dir, control, load_models=needs_llm_processing)
-    batch_started_at = time.time()
-    completed_files_this_run = 0
+    processing_files_this_run = 0
+    processing_elapsed_seconds = 0.0
     stats = RunStats()
     run_id = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
     stats.files_total = len(pending)
@@ -800,12 +931,21 @@ def run_batch(
 
     for idx, (path, fingerprint, context) in enumerate(pending, 1):
         if runtime.STOP_REQUESTED or stop_file.exists():
-            print("Stop requested before starting next file.")
+            if runtime.STOP_REQUESTED:
+                print("Ctrl+C stop acknowledged before the next file; exiting without confirmation.", flush=True)
+            else:
+                print("Stop request detected before the next file; exiting.", flush=True)
             break
 
         cache_path = processed_data_cache_path(processed_data_dir, fingerprint, path)
         pipeline.active_context = context
-        file_eta = format_duration(estimate_remaining_seconds(completed_files_this_run, len(pending), time.time() - batch_started_at))
+        file_eta = format_duration(
+            estimate_remaining_seconds(
+                processing_files_this_run,
+                processing_work_total,
+                processing_elapsed_seconds,
+            )
+        )
         print(f"\nFile {idx}/{len(pending)} eta_files={file_eta}")
 
         recorder = (
@@ -836,6 +976,28 @@ def run_batch(
         failure_start = pipeline.performance.failures
         fallback_start = pipeline.fallback_count
         reprocess_backup_paths: dict[str, str] = {}
+        checkpoint_namespace = f"{fingerprint}.force.{run_id}" if force_reprocess else None
+
+        def process_current_file() -> dict[str, Any]:
+            nonlocal processing_elapsed_seconds, processing_files_this_run, processing_work_total
+            if fingerprint not in processing_work_keys:
+                # A cache can fail validation after the initial work list was
+                # built.  Add that rebuild to the ETA denominator when it is
+                # discovered, rather than treating the cache validation as a
+                # completed sample.
+                processing_work_keys.add(fingerprint)
+                processing_work_total += 1
+            kwargs: dict[str, Any] = {}
+            if context is not None:
+                kwargs["context"] = context
+            if checkpoint_namespace is not None:
+                kwargs["checkpoint_namespace"] = checkpoint_namespace
+            started_at = time.perf_counter()
+            try:
+                return pipeline.process_file(path, recorder, **kwargs)
+            finally:
+                processing_elapsed_seconds += max(0.0, time.perf_counter() - started_at)
+                processing_files_this_run += 1
 
         def finalize_result(result: dict[str, Any], outcome: str | None = None) -> dict[str, Any]:
             if context:
@@ -883,8 +1045,16 @@ def run_batch(
                     recorder,
                     state_path,
                     run_id,
+                    processed_data_dir=processed_data_dir,
+                    source_path=path,
+                    episode_id=(context or {}).get("episode_id"),
+                    processing_key=fingerprint,
+                    previous_state={
+                        key: entry
+                        for key, entry in (state.get("files") or {}).items()
+                        if isinstance(entry, dict) and str(entry.get("path")) == str(path)
+                    },
                 )
-                pipeline.clear_file_checkpoints(path, fingerprint)
 
             if cache_path.exists() and not force_reprocess:
                 try:
@@ -956,16 +1126,16 @@ def run_batch(
                         {"run_id": run_id, "started_at": dt.datetime.now(dt.timezone.utc).isoformat(), "current_stage": "processing", **(context or {})},
                     )
                     save_state(state_path, state)
-                    result = (
-                        pipeline.process_file(path, recorder, context)
-                        if context is not None
-                        else pipeline.process_file(path, recorder)
-                    )
+                    result = process_current_file()
                     stats.llm_files += 1
                     if result["status"] != "completed":
+                        if checkpoint_namespace is not None:
+                            pipeline.clear_file_checkpoints(path, fingerprint, checkpoint_namespace)
                         if reprocess_backup_paths:
                             result["reprocess_backup_paths"] = reprocess_backup_paths
                         result = finalize_result(result, "skipped")
+                        if reprocess_backup_paths:
+                            _restore_reprocess_artifacts(reprocess_backup_paths)
                         mark_state(state, fingerprint, path, result["status"], result)
                         save_state(state_path, state)
                         stats.files_skipped += 1
@@ -978,6 +1148,10 @@ def run_batch(
                     else:
                         pipeline.save_cached_documents(cache_path, path, fingerprint, docs)
                     if reprocess_backup_paths:
+                        _update_reprocess_manifest(
+                            reprocess_backup_paths,
+                            replacement_status={"cache": "promoted"},
+                        )
                         result["reprocess_backup_paths"] = reprocess_backup_paths
                     result["cache_path"] = str(cache_path)
                     result["output_cache_path"] = str(cache_path)
@@ -993,16 +1167,16 @@ def run_batch(
                     {"run_id": run_id, "started_at": dt.datetime.now(dt.timezone.utc).isoformat(), "current_stage": "processing", **(context or {})},
                 )
                 save_state(state_path, state)
-                result = (
-                    pipeline.process_file(path, recorder, context)
-                    if context is not None
-                    else pipeline.process_file(path, recorder)
-                )
+                result = process_current_file()
                 stats.llm_files += 1
                 if result["status"] != "completed":
+                    if checkpoint_namespace is not None:
+                        pipeline.clear_file_checkpoints(path, fingerprint, checkpoint_namespace)
                     if reprocess_backup_paths:
                         result["reprocess_backup_paths"] = reprocess_backup_paths
                     result = finalize_result(result, "skipped")
+                    if reprocess_backup_paths:
+                        _restore_reprocess_artifacts(reprocess_backup_paths)
                     mark_state(state, fingerprint, path, result["status"], result)
                     save_state(state_path, state)
                     stats.files_skipped += 1
@@ -1015,6 +1189,10 @@ def run_batch(
                 else:
                     pipeline.save_cached_documents(cache_path, path, fingerprint, docs)
                 if reprocess_backup_paths:
+                    _update_reprocess_manifest(
+                        reprocess_backup_paths,
+                        replacement_status={"cache": "promoted"},
+                    )
                     result["reprocess_backup_paths"] = reprocess_backup_paths
                 result["cache_path"] = str(cache_path)
                 result["output_cache_path"] = str(cache_path)
@@ -1024,6 +1202,16 @@ def run_batch(
             if recorder is not None and result.get("status") == "completed" and result.get("source") != "processed_data_cache":
                 recorder.set_outcome("completed_with_warnings" if recorder.has_anomalies() else "clean")
             result = finalize_result(result)
+            if reprocess_backup_paths:
+                errata_promoted = bool(result.get("errata_json_path") and result.get("errata_markdown_path"))
+                if recorder is not None and not errata_promoted:
+                    raise RuntimeError("forced reprocess errata promotion failed")
+                errata_status = "promoted" if errata_promoted else "not_applicable"
+                _update_reprocess_manifest(
+                    reprocess_backup_paths,
+                    replacement_status={"errata_json": errata_status, "errata_markdown": errata_status},
+                    promotion_status="completed",
+                )
 
             moved_to = None
             if result["status"] == "completed" and config.move_processed_files:
@@ -1033,8 +1221,6 @@ def run_batch(
                 result["moved_to"] = moved_to
             mark_state(state, fingerprint, path, result["status"], result)
             save_state(state_path, state)
-            if result["status"] in {"completed", "skipped"}:
-                completed_files_this_run += 1
             if result["status"] == "completed":
                 stats.files_completed += 1
             elif result["status"] == "skipped":
@@ -1048,6 +1234,10 @@ def run_batch(
             if recorder is not None:
                 recorder.set_outcome("interrupted", failed_stage="file", exception=exc)
             errata_result = finalize_result({}, "interrupted")
+            if checkpoint_namespace is not None:
+                pipeline.clear_file_checkpoints(path, fingerprint, checkpoint_namespace)
+            if reprocess_backup_paths:
+                _restore_reprocess_artifacts(reprocess_backup_paths)
             if reprocess_backup_paths:
                 errata_result["reprocess_backup_paths"] = reprocess_backup_paths
             mark_state(state, fingerprint, path, "interrupted", {"error": str(exc), **errata_result})
@@ -1055,12 +1245,20 @@ def run_batch(
             stats.files_failed += 1
             stats.failures.append({"path": str(path), "error": str(exc), "type": "interrupted", **errata_result})
             write_run_snapshot(snapshot_path, stats, pipeline.performance)
-            print("Stop request handled. Progress state was saved; this file will be retried on the next run.")
+            print(
+                "Ctrl+C stop acknowledged. Progress state was saved; this file will be retried "
+                "on the next run. Exiting without confirmation.",
+                flush=True,
+            )
             break
         except Exception as exc:
             if recorder is not None:
                 recorder.set_outcome("failed", failed_stage="file", exception=exc)
             errata_result = finalize_result({}, "failed")
+            if checkpoint_namespace is not None:
+                pipeline.clear_file_checkpoints(path, fingerprint, checkpoint_namespace)
+            if reprocess_backup_paths:
+                _restore_reprocess_artifacts(reprocess_backup_paths)
             if reprocess_backup_paths:
                 errata_result["reprocess_backup_paths"] = reprocess_backup_paths
             mark_state(state, fingerprint, path, "failed", {"error": f"{type(exc).__name__}: {exc}", **errata_result})
@@ -1075,7 +1273,14 @@ def run_batch(
             break
 
         if runtime.STOP_REQUESTED or stop_file.exists():
-            print("Stop request detected. Batch will resume with the next pending file on the next run.")
+            if runtime.STOP_REQUESTED:
+                print(
+                    "Ctrl+C stop acknowledged at the safe boundary. Batch will resume with the next "
+                    "pending file on the next run; exiting without confirmation.",
+                    flush=True,
+                )
+            else:
+                print("Stop request detected. Batch will resume with the next pending file on the next run.", flush=True)
             break
 
     pipeline.performance.final_report()
@@ -1099,8 +1304,11 @@ def run_batch(
     if config.enable_temporal_artifacts:
         temporal_summary = build_temporal_artifacts(processed_data_dir, resolve_path(project_dir, config.temporal_artifact_path), include_trajectories=config.enable_temporal_trajectories, include_contradiction_candidates=config.enable_contradiction_candidates, missing_interval_days=config.temporal_missing_interval_days)
         print(f"Temporal research artifact refreshed: {temporal_summary['output_path']} ({temporal_summary['claim_count']} claims).")
-    print("\nBatch run complete.")
-    return 0
+    if runtime.STOP_REQUESTED:
+        print("\nCtrl+C handling complete. State and reports are saved; exiting now.", flush=True)
+    else:
+        print("\nBatch run complete.")
+    return 130 if runtime.STOP_SIGNAL == signal.SIGINT else 0
 
 def build_topic_index(config: PipelineConfig, project_dir: Path) -> int:
     """Build or incrementally refresh the cache-only topic index from processed_data."""
@@ -1176,6 +1384,24 @@ def config_doctor(config: PipelineConfig, project_dir: Path) -> int:
         test_model_inference(config)
     print("Processed cache schema:")
     print(dumps_schema_summary())
+    return 0
+
+
+def cache_embedding_model(config: PipelineConfig, project_dir: Path) -> int:
+    """Explicitly warm the embedding model cache; this is the networked path."""
+    runtime.load_runtime_deps()
+    cache_dir = str(config.embedding_cache_dir or "").strip()
+    cache_description = (
+        str(resolve_path(project_dir, cache_dir))
+        if cache_dir
+        else "the default Hugging Face/sentence-transformers cache"
+    )
+    print(f"Warming embedding model cache for '{config.embedding_model}' in {cache_description}.")
+    runtime.HuggingFaceEmbeddings(
+        model_name=config.embedding_model,
+        **embedding_constructor_kwargs(config, project_dir, local_files_only=False),
+    )
+    print("Embedding model cache is ready.")
     return 0
 
 def evaluate_model(config: PipelineConfig, project_dir: Path, limit: int = 3) -> int:
@@ -1298,6 +1524,7 @@ def parse_args() -> argparse.Namespace:
         help="Validate and summarize errata records; optionally provide one JSON path or name.",
     )
     parser.add_argument("--config-doctor", action="store_true", help="Validate operational config and LM Studio settings before a batch.")
+    parser.add_argument("--cache-embedding-model", action="store_true", help="Download/warm the configured embedding model cache explicitly.")
     parser.add_argument("--model-eval", action="store_true", help="Run the model-evaluation harness on transcript slices.")
     parser.add_argument("--model-eval-limit", type=int, default=3, help="Maximum transcript files to sample for --model-eval.")
     parser.add_argument("--retrieval-eval", action="store_true", help="Score captured retrieval results against a judged query set.")
@@ -1320,6 +1547,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     """CLI entry point for batch processing, diagnostics, and model evaluation."""
+    configure_console_output()
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
 
@@ -1393,6 +1621,8 @@ def main() -> int:
         return inspect_errata(config, project_dir, args.inspect_errata or None)
     if args.config_doctor:
         return config_doctor(config, project_dir)
+    if args.cache_embedding_model:
+        return cache_embedding_model(config, project_dir)
     if args.model_eval:
         return evaluate_model(config, project_dir, args.model_eval_limit)
     if args.retrieval_eval:

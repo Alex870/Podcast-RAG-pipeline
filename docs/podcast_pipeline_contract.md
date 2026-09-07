@@ -75,7 +75,21 @@ Schema `2.1` provenance requirements:
 - Every leaf has `source_segment_ids`, `source_spans`, or both `start_time` and `end_time` identifying its transcript evidence.
 - Every summary, thesis, and position card has non-empty `child_ids`; the validator follows those links until it reaches leaf evidence.
 - `parent_id` is the structural hierarchy link. Position-card `child_ids` are evidence references and may point to nodes that also belong to the hierarchy.
+- Episode thesis nodes may include optional `generation_source_node_ids`. These identify the deepest meaningful multi-summary nodes supplied to thesis generation; they are references for generation provenance only, not structural edges, and do not replace the thesis `child_ids` hierarchy roots.
+- New caches record a file-local `hierarchy_manifest` and `cluster_telemetry`. These describe the adaptive rollup decisions and must not be combined across files when interpreting one cache.
 - Each serialized node carries `source_node_fingerprint` and `representation_fingerprints` for deterministic audit and delta backfill.
+
+Adaptive hierarchy semantics:
+
+- Zero or one current node stops hierarchy construction.
+- Two through eleven current nodes create one forced parent summary.
+- Twelve or more current nodes use semantic clustering subject to the minimum-group, dominant-cluster, noise-rate, and `max_clusters` quality gates.
+- Summary levels use an adaptive HDBSCAN cluster-size range and explicit `min_samples` settings because their input is the smaller set of generated summaries rather than leaf chunks.
+- A rejected semantic result uses deterministic chronological groups of `group_fallback_size`, and the process continues until `max_levels` or a genuine stop condition.
+
+The `hierarchy_algorithm_version` and hierarchy settings participate in the
+generation and processing fingerprints. Changing them invalidates generated
+caches while leaving older versioned cache files untouched.
 
 The representation manifest also contains `builder_version` and `config_fingerprint`. A representation fingerprint includes the source cache fingerprint, source-node identity/evidence, builder version, relevant configuration, and the generated representation text. It is separate from `stable_document_id`.
 
@@ -119,6 +133,22 @@ python .\podcast_rag_pipeline.py --config .\podcast_rag_config.json --export-den
 ```
 
 The backfill reuses valid hierarchy and position nodes, rebuilds only deterministic metadata/representations, validates evidence closure, and writes a `delta` record. The export contains stable document IDs, `embedding_text`, `page_content`, metadata, and cache manifests for downstream evaluation.
+
+Forced maintenance rebuilds use:
+
+```powershell
+python .\podcast_rag_pipeline.py process --partition <partition-id> --episode <episode-id> --force-reprocess
+```
+
+When invoking the script through Conda directly, use
+`conda run --live-stream ... python -u ...`; Conda otherwise captures the
+child process's stdout and stderr until exit. The maintained PowerShell
+launchers use live streaming automatically.
+
+The force flag is scoped to exactly one episode and does not affect cache
+identity. It bypasses the canonical cache and normal checkpoints using a
+temporary namespace, creates a rollback bundle with artifact checksums and
+presence metadata, then atomically promotes the replacement artifacts.
 
 ## Chroma Export
 

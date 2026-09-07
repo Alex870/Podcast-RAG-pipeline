@@ -7,9 +7,11 @@ param(
     [string]$BaseUrl,
     [string]$Partition,
     [string]$Manifest,
+    [string]$Episode,
     [int]$MaxParallelModelRequests,
     [switch]$OneFile,
     [switch]$Managed,
+    [switch]$ForceReprocess,
     [switch]$CreateStopFile,
     [switch]$ClearStopFile,
     [switch]$InspectCache,
@@ -22,15 +24,8 @@ param(
     [switch]$SkipDependencyCheck
 )
 
-function Wait-ForExitPrompt {
-    if (-not $env:PODCAST_RAG_SUPPRESS_PAUSE -and $Host.Name -eq "ConsoleHost") {
-        [void](Read-Host "Press Enter to continue")
-    }
-}
-
 function Exit-Script {
     param([int]$Code = 0)
-    Wait-ForExitPrompt
     exit $Code
 }
 
@@ -54,7 +49,7 @@ function Invoke-ProjectPython {
         [string[]]$Arguments
     )
 
-    & conda run --no-capture-output -n $CondaEnvName python @Arguments
+    & conda run --no-capture-output -n $CondaEnvName python -u @Arguments
 }
 
 function Test-CondaEnv {
@@ -193,6 +188,10 @@ if ($Partition -and $Manifest) {
 }
 
 $managedRun = $Managed -or $Partition -or $Manifest
+if (($Episode -or $ForceReprocess) -and -not $managedRun) {
+    Write-Error "-Episode and -ForceReprocess are only valid for managed partition runs."
+    Exit-Script 1
+}
 if ($managedRun) {
     if ($InputDir -or $FileGlob) {
         Write-Error "Managed partition runs do not accept -InputDir or -FileGlob. Use the partition handoff inbox instead."
@@ -205,8 +204,14 @@ if ($managedRun) {
     } elseif ($Manifest) {
         $argsList += @("--manifest", $Manifest)
     }
+    if ($Episode) {
+        $argsList += @("--episode", $Episode)
+    }
     if ($OneFile) {
         $argsList += "--one-file"
+    }
+    if ($ForceReprocess) {
+        $argsList += "--force-reprocess"
     }
 
     $pythonArgs = @($PythonScript) + $argsList

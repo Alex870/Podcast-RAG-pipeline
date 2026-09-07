@@ -80,11 +80,22 @@ New configuration fields:
 
 | Field | Default | Purpose |
 |---|---|---|
+| `embedding_cache_dir` | `""` | Optional explicit cache directory; empty uses the default Hugging Face/sentence-transformers cache. |
+| `embedding_local_files_only` | `true` | Prevents embedding startup from contacting Hugging Face; requires the model to already be cached. |
 | `embedding_text_mode` | `page-content-v1` | Selects plain display text or experimental `context-header-v1` for the emitted dense representation. |
 | `lexical_text_mode` | `normalized-lexical-v1` | Selects the emitted lexical representation; use `page-content-v1` to disable metadata enrichment. |
 | `contextual_header_max_chars` | `700` | Bounds the deterministic header when contextual dense text is enabled. |
 | `retrieval_evaluation_query_set` | `evaluation/query_sets/podcast-baseline-v1.jsonl` | Default judged-query JSONL path. |
 | `retrieval_evaluation_output_dir` | `evaluation/results` | Default JSON and Markdown evaluation-report directory. |
+| `hierarchy_algorithm_version` | `adaptive-v2` | Version of adaptive hierarchy rollup policy. |
+| `hierarchy_min_parent_docs` | `2` | Minimum current-node count required to form a parent. |
+| `hierarchy_max_dominant_cluster_fraction` | `0.60` | Maximum accepted semantic dominant-cluster fraction. |
+| `hierarchy_max_noise_rate` | `0.25` | Maximum accepted semantic noise rate. |
+| `hierarchy_summary_cluster_size_divisor` | `12` | Divisor used to adapt HDBSCAN cluster size for summary levels. |
+| `hierarchy_summary_min_cluster_size` | `3` | Minimum HDBSCAN cluster size for summary levels. |
+| `hierarchy_summary_max_cluster_size` | `6` | Maximum HDBSCAN cluster size for summary levels. |
+| `hierarchy_summary_min_samples` | `2` | Explicit HDBSCAN `min_samples` for summary levels. |
+| `hierarchy_fallback_mode` | `chronological` | Safe deterministic grouping strategy after a semantic quality-gate failure. |
 
 ## First-Time Setup
 
@@ -96,7 +107,7 @@ New configuration fields:
 .\Run Podcast RAG Pipeline.ps1
 ```
 
-Choose `7` to create or refresh the Conda environment. The underlying launcher uses the `podcast-rag-pipeline` Conda environment by default. Run the script in `scripts` directly with `-CondaEnvName` if you want a different name.
+Choose `6` to create or refresh the Conda environment. The underlying launcher uses the `podcast-rag-pipeline` Conda environment by default. Run the script in `scripts` directly with `-CondaEnvName` if you want a different name.
 
 4. Copy the example config:
 
@@ -114,7 +125,7 @@ Before a batch run, verify the local environment:
 .\Run Podcast RAG Pipeline.ps1
 ```
 
-Choose `1` for environment validation.
+Choose `5` for environment validation.
 
 To start the main batch pipeline:
 
@@ -122,7 +133,22 @@ To start the main batch pipeline:
 .\Run Podcast RAG Pipeline.ps1
 ```
 
-Choose `2` for the main pipeline. The menu also exposes processed-cache inspection, live control updates, stop-file management, and Conda environment creation. The main pipeline launcher still creates `podcast_rag_config.json` from the example if needed, applies optional command-line overrides, checks Python dependencies, and runs the pipeline.
+Choose `1` to process or resume a managed partition. The menu displays partitions by friendly name, shows handoff and episode status, and reuses valid processed caches and within-file checkpoints automatically. Choose `8` for the legacy flat-input workflow.
+
+The interactive menu remains open after each operation. Choose `2` for the partition management center, where you can create partitions with a friendly name, inspect status, select the active partition, archive or restore partitions, validate setup, and control a running partition. Managed stop requests and concurrency settings are written to the selected partition's own `state` directory.
+
+The main pipeline launcher still creates `podcast_rag_config.json` from the example if needed, applies optional command-line overrides, checks Python dependencies, and runs the pipeline. Existing direct `-Action` calls remain available for automation.
+
+For a direct Conda invocation, use live-streaming and unbuffered Python so
+progress is displayed as it is produced rather than when the process exits:
+
+```powershell
+conda run --live-stream -n podcast-rag-pipeline python -u .\podcast_rag_pipeline.py process --partition <partition-id>
+```
+
+`--live-stream` is Conda's alias for `--no-capture-output`. The supplied
+PowerShell launchers already use that mode, and the pipeline also configures
+line-buffered output for direct entry-point calls.
 
 To build or refresh the topic index from already-processed caches without re-running the main pipeline:
 
@@ -130,7 +156,7 @@ To build or refresh the topic index from already-processed caches without re-run
 .\Run Podcast RAG Pipeline.ps1
 ```
 
-Choose `8` for `Build or refresh the topic index`.
+Choose `7` and then `2` for `Build or refresh the topic index`.
 
 That topic refresh path is intentionally incremental. It scans the existing `processed_data` caches, rebuilds only new or changed per-episode topic contributions, and updates the aggregate `state/topic_index.json` catalog without redoing the expensive transcript summarization work.
 
@@ -167,13 +193,40 @@ If you prefer to skip the menu, the root launcher also supports direct actions:
 
 The underlying PowerShell scripts remain available in `scripts\` when you want to bypass the menu and call a specific launcher directly.
 
+For backwards compatibility, `-Action Run` remains the direct legacy
+flat-input action.  Managed partition processing is available from the
+interactive menu or through the underlying `-Managed -Partition` parameters
+shown below.
+
+### Hugging Face embedding cache
+
+The embedding model is loaded from the local sentence-transformers/Hugging Face
+cache and `embedding_local_files_only` defaults to `true`. This means normal
+pipeline starts do not contact Hugging Face after the model has been cached.
+The default empty `embedding_cache_dir` keeps the library's normal per-user
+cache; set it to a local path when you want an explicit cache location.
+
+On a fresh machine, warm the cache once while network access is available:
+
+```powershell
+python .\podcast_rag_pipeline.py --config .\podcast_rag_config.json --cache-embedding-model
+```
+
+That explicit cache command is the only normal operation that is expected to
+contact Hugging Face. If the model is missing while offline mode is enabled,
+the pipeline stops with an actionable message instead of reaching out to the
+Hub.
+
 Useful launcher parameters:
 
 ```powershell
+.\scripts\Run-PodcastRagPipeline.ps1 -Managed -Partition "podcast-history"
+.\scripts\Run-PodcastRagPipeline.ps1 -Managed -Partition "podcast-history" -OneFile
+.\scripts\Run-PodcastRagPipeline.ps1 -Managed -Partition "podcast-history" -Episode "episode-01"
+.\scripts\Run-PodcastRagPipeline.ps1 -Managed -Partition "podcast-history" -Episode "episode-01" -ForceReprocess
 .\scripts\Run-PodcastRagPipeline.ps1 -InputDir "C:\path\to\transcripts"
 .\scripts\Run-PodcastRagPipeline.ps1 -Model "mistral-small-3.2-24b-instruct-2506"
 .\scripts\Run-PodcastRagPipeline.ps1 -BaseUrl "http://127.0.0.1:1234/v1"
-.\scripts\Run-PodcastRagPipeline.ps1 -OneFile
 .\scripts\Run-PodcastRagPipeline.ps1 -MaxParallelModelRequests 2
 .\scripts\Run-PodcastRagPipeline.ps1 -CreateStopFile
 .\scripts\Run-PodcastRagPipeline.ps1 -ClearStopFile
@@ -222,6 +275,25 @@ The migration assistant is designed around the same principle. It can copy forwa
 To insert or reinsert processed caches into Chroma, use the separate `Chroma DB Import` project.
 
 New processed caches use schema version `2.1`; schema `2.0` remains readable. Each cache includes a prompt/version manifest, representation manifest, config fingerprint, model and embedding names, source transcript fingerprint and schema version, stable document IDs, cluster telemetry, fallback counts, token maxima, validation counts, and an import manifest for downstream Chroma import.
+
+The hierarchy settings and prompt/pipeline versions participate in the
+generation and processing fingerprints. Changing them creates a new versioned
+cache key; existing cache files remain available for rollback or comparison.
+The managed force command bypasses the selected canonical cache and normal
+checkpoints without changing cache identity:
+
+```powershell
+python .\podcast_rag_pipeline.py process --partition <partition-id> --episode <episode-id> --force-reprocess
+```
+
+Before the rebuild, the command writes `state\reprocess_backups\<run-id>\`
+with the prior cache and errata pair when present, original paths, SHA-256
+checksums, artifact presence/absence, prior state metadata, and replacement
+status. Replacement files are written atomically; failed promotion restores
+the previous canonical artifacts. Diagnosis is advisory only: its allowed
+actions are `code`, `config`, `data`, `rerun`, and `human_review`, and failed
+diagnoses retain bounded errors, invalid action values by index, digests, and a
+bounded response excerpt—not a raw or unbounded model response.
 
 The upstream contract reader accepts both `correction-manifest-v1` and `correction-manifest-v2`. V2 approvals expose stable correction and affected-span identities while preserving source-hash and before-value validation. When the transcription project is configured with this repository path, notifications arrive under `state/transcription_corrections`; these are inputs to the processed-delta workflow, not a reason to rerun unrelated episodes.
 
@@ -283,6 +355,8 @@ For Qwen reasoning models in LM Studio, keep `llm_max_tokens` high enough for hi
 By default, the final `episode_thesis` document is a deterministic bounded overview instead of another LLM reduction pass. This avoids throwing away speaker/date resolution at the end of a long episode. The retrieval-grade evidence remains in `leaf_chunk`, `cluster_summary`, and `position_card` documents. Set `episode_thesis_reduce_with_llm` to `true` if you want the older LLM-generated thesis behavior.
 
 Clustering can use `clustering_reduction: "pca"` or `"umap"` when `umap-learn` is installed. `grouping_mode` supports `semantic`, `chronological`, `speaker_first`, and `hybrid`/`topic_time` grouping. Cluster summaries and position cards get deterministic topic tags, fallback/model confidence metadata, compression telemetry, evidence excerpts, and stricter position-card validation.
+
+Hierarchy construction uses `hierarchy_algorithm_version: "adaptive-v2"`. A level with zero or one current node stops; two through eleven nodes receive one forced parent; twelve or more nodes use semantic clustering with dominant-cluster, noise-rate, group-count, and `max_clusters` quality gates. Summary levels use a less conservative adaptive HDBSCAN profile: cluster size is bounded between `hierarchy_summary_min_cluster_size` and `hierarchy_summary_max_cluster_size` using `hierarchy_summary_cluster_size_divisor`, and `hierarchy_summary_min_samples` is explicit. Failed semantic gates use deterministic chronological groups of `group_fallback_size` and continue to the next level. Each processed cache records a file-local `hierarchy_manifest` and `cluster_telemetry`, including the strategy, clustering parameters, counts, quality metrics, fallback reasons, and stop reason. The episode thesis keeps structural hierarchy roots in `child_ids` and records its separate generation inputs in optional `generation_source_node_ids`.
 
 By default, input JSON files are not moved after processing. Set `move_processed_files` to `true` if you prefer the older workflow where processed files are moved to `processed`.
 

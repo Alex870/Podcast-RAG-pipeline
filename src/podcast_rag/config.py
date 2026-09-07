@@ -5,6 +5,7 @@ import json
 import os
 from dataclasses import dataclass, fields
 from pathlib import Path
+from typing import Any
 
 from podcast_rag.schema import PROCESSED_CACHE_SCHEMA_VERSION
 
@@ -26,6 +27,11 @@ class PipelineConfig:
     errata_excerpt_max_chars: int = 360
     move_processed_files: bool = False
     embedding_model: str = "BAAI/bge-large-en-v1.5"
+    # Empty uses the sentence-transformers/Hugging Face user cache. Set this
+    # to a repo- or machine-local directory when the cache should be explicit.
+    embedding_cache_dir: str = ""
+    # Prevent startup from checking the Hub after the model has been warmed.
+    embedding_local_files_only: bool = True
     lm_studio_base_url: str = "http://127.0.0.1:1234/v1"
     lm_studio_api_key: str = "lm-studio"
     lm_studio_model: str = "mistral-small-3.2-24b-instruct-2506"
@@ -38,6 +44,15 @@ class PipelineConfig:
     max_clusters: int = 300
     min_docs_to_cluster: int = 12
     group_fallback_size: int = 6
+    hierarchy_algorithm_version: str = "adaptive-v2"
+    hierarchy_min_parent_docs: int = 2
+    hierarchy_max_dominant_cluster_fraction: float = 0.60
+    hierarchy_max_noise_rate: float = 0.25
+    hierarchy_summary_cluster_size_divisor: int = 12
+    hierarchy_summary_min_cluster_size: int = 3
+    hierarchy_summary_max_cluster_size: int = 6
+    hierarchy_summary_min_samples: int = 2
+    hierarchy_fallback_mode: str = "chronological"
     rollup_char_budget: int = 6000
     leaf_chunk_size: int = 1800
     leaf_chunk_overlap: int = 250
@@ -97,6 +112,28 @@ def resolve_path(base_dir: Path, value: str) -> Path:
         return path
     return base_dir / path
 
+
+def embedding_constructor_kwargs(
+    config: PipelineConfig,
+    project_dir: Path,
+    *,
+    local_files_only: bool | None = None,
+) -> dict[str, Any]:
+    """Build shared Hugging Face embedding-constructor options."""
+    cache_dir = str(config.embedding_cache_dir or "").strip()
+    kwargs: dict[str, Any] = {
+        "model_kwargs": {
+            "local_files_only": (
+                config.embedding_local_files_only
+                if local_files_only is None
+                else local_files_only
+            ),
+        },
+    }
+    if cache_dir:
+        kwargs["cache_folder"] = str(resolve_path(project_dir, cache_dir))
+    return kwargs
+
 def load_config(config_path: Path) -> PipelineConfig:
     """Load JSON config, rejecting malformed files with actionable location info."""
     if not config_path.exists():
@@ -116,6 +153,19 @@ def load_config(config_path: Path) -> PipelineConfig:
 def apply_env_overrides(config: PipelineConfig) -> PipelineConfig:
     """Apply environment-level overrides for model and endpoint settings."""
     config.embedding_model = os.getenv("EMBEDDING_MODEL", config.embedding_model)
+    config.embedding_cache_dir = os.getenv("EMBEDDING_CACHE_DIR", config.embedding_cache_dir)
+    local_files_only = os.getenv("EMBEDDING_LOCAL_FILES_ONLY")
+    if local_files_only is not None:
+        normalized = local_files_only.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            config.embedding_local_files_only = True
+        elif normalized in {"0", "false", "no", "off"}:
+            config.embedding_local_files_only = False
+        else:
+            raise SystemExit(
+                "Invalid EMBEDDING_LOCAL_FILES_ONLY value: "
+                f"{local_files_only!r}. Use true or false."
+            )
     config.lm_studio_base_url = os.getenv("LM_STUDIO_BASE_URL", config.lm_studio_base_url)
     config.lm_studio_api_key = os.getenv("LM_STUDIO_API_KEY", config.lm_studio_api_key)
     config.lm_studio_model = os.getenv("LM_STUDIO_MODEL", config.lm_studio_model)
@@ -147,13 +197,17 @@ def config_fingerprint(config: PipelineConfig) -> str:
         "retrieval_evaluation_output_dir",
         "temporal_artifact_path",
         "advanced_retrieval_dir",
+        "embedding_cache_dir",
     }
+    runtime_only_fields = {"embedding_local_files_only"}
     secret_fields = {"lm_studio_api_key"}
     payload = json.dumps(
         {
             field.name: getattr(config, field.name)
             for field in fields(config)
-            if field.name not in path_fields and field.name not in secret_fields
+            if field.name not in path_fields
+            and field.name not in secret_fields
+            and field.name not in runtime_only_fields
         },
         sort_keys=True,
         default=str,
@@ -183,6 +237,8 @@ def generation_config_fingerprint(config: PipelineConfig) -> str:
         "temporal_missing_interval_days",
         "enable_advanced_retrieval_prototypes",
         "advanced_retrieval_dir",
+        "embedding_cache_dir",
+        "embedding_local_files_only",
     }
     payload = json.dumps(
         {

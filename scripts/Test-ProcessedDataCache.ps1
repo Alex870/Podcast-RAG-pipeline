@@ -1,5 +1,6 @@
 param(
-    [string]$ProcessedDataDir
+    [string]$ProcessedDataDir,
+    [string]$Config
 )
 
 function Wait-ForExitPrompt {
@@ -21,7 +22,7 @@ trap {
 
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 if (-not $ProcessedDataDir) {
-    $configPath = Join-Path $ProjectRoot "podcast_rag_config.json"
+    $configPath = if ($Config) { $Config } else { Join-Path $ProjectRoot "podcast_rag_config.json" }
     $examplePath = Join-Path $ProjectRoot "examples\podcast_rag_config.example.json"
     $configToRead = if (Test-Path -LiteralPath $configPath) { $configPath } else { $examplePath }
     $config = Get-Content -LiteralPath $configToRead -Raw | ConvertFrom-Json
